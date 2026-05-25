@@ -1,0 +1,11 @@
+name = "raw-dex-market-api"
+main = "src/worker.js"
+compatibility_date = "2026-05-12"
+
+[vars]
+SNAPSHOT_PREFIX = "dex-data"
+EDGE_CACHE_SECONDS = "20"
+
+[[r2_buckets]]
+binding = "MARKET_DATA"
+bucket_name = "raw-dex-market-data"
