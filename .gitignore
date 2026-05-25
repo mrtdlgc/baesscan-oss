@@ -11,6 +11,7 @@ __github_worktree*/
 apps/seo/.astro/
 .env
 .env.*
+!.env.example
 data/state.json
 data/state.json.tmp
 data/state.json.chunks/
