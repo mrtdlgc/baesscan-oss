@@ -18,12 +18,15 @@ import {
 import { buildCopyShadowSnapshotFromConfig, copyShadowConfigFromEnv } from "../services/copyShadow";
 import {
   buildWalletPnlAnalyticsSnapshot,
+  WALLET_PNL_HOOK_POLICY_VERSION,
+  walletPnlAnalyticsHasIneligibleBaseV4Pool,
   walletPnlAnalyticsHasIgnoredToken,
   walletPnlAnalyticsMissingTokenCreators,
   type WalletPnlIndexer
 } from "../services/walletPnl";
 import { enrichWalletPnlAnalyticsTokenCreators, enrichWalletPnlTokenSummaries } from "../services/walletPnlCreatorDenylist";
 import { isWalletPnlIgnoredToken } from "../services/walletPnlFilters";
+import { walletPnlBaseV4HookPolicy } from "../services/walletPnlHookPolicy";
 import type {
   CopyShadowConfig,
   Storage,
@@ -154,14 +157,13 @@ interface WalletPnlFlatAnalyticsStore {
 let stylesheetBundle: Buffer | undefined;
 let stylesheetBundleMissing = false;
 let sitemapBundle: Buffer | undefined;
-let robotsBundle: Buffer | undefined;
 
 // HTML responses are deterministic per (env, store snapshot view); cache them briefly
 // so every hit doesn't re-concatenate the embedded client JS.
 const HTML_CACHE_TTL_MS = 30_000;
 const htmlCache = new Map<string, { expiresAt: number; body: string }>();
 const SITEMAP_CACHE_TTL_MS = 5 * 60_000;
-let generatedSitemapCache: { expiresAt: number; body: Buffer } | undefined;
+let generatedSitemapCache: { expiresAt: number; intelEnabled: boolean; body: Buffer } | undefined;
 const walletPnlHistoricalBackfills = new Set<string>();
 const walletPnlHistoricalPrecomputes = new Set<string>();
 const walletPnlAnalyticsMaterializations = new Set<string>();
@@ -169,8 +171,10 @@ const walletPnlAnalyticsMaterializations = new Set<string>();
 export function startWebServer(deps: WebDeps): { stop: () => Promise<void> } {
   preloadStylesheetBundle(deps);
   preloadGeneratedSeoFiles(deps);
-  walletPnlScheduleAnalyticsMaterialization(deps, deps.env.walletPnlChain, { reason: "startup", delayMs: 5_000 });
-  const historicalPrecomputeTimers = startWalletPnlHistoricalPrecomputeHeartbeat(deps);
+  if (deps.env.intelEnabled) {
+    walletPnlScheduleAnalyticsMaterialization(deps, deps.env.walletPnlChain, { reason: "startup", delayMs: 5_000 });
+  }
+  const historicalPrecomputeTimers = deps.env.intelEnabled ? startWalletPnlHistoricalPrecomputeHeartbeat(deps) : [];
   const healthInterval = startRpcHealthHeartbeat(deps);
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -272,8 +276,9 @@ async function handleRequest(deps: WebDeps, req: http.IncomingMessage, res: http
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const parts = url.pathname.split("/").filter(Boolean);
   if (url.pathname === "/health") return json(res, 200, { ok: true, chains: deps.env.enabledChains });
-  if (url.pathname === "/sitemap.xml") return handleSitemap(res);
-  if (url.pathname === "/robots.txt") return handleRobots(res);
+  if (url.pathname === "/sitemap.xml") return handleSitemap(res, deps.env.intelEnabled);
+  if (url.pathname === "/robots.txt") return handleRobots(res, deps.env.intelEnabled);
+  if (!deps.env.intelEnabled && isIntelRoute(url.pathname)) return notFound(res);
   if (url.pathname === "/api/chains") return json(res, 200, publicChains(deps));
   if (parts[0] === "api" && (parts[1] === "contract-creator" || parts[1] === "contract-creation") && isChainSlug(parts[2])) {
     return handleContractCreator(deps, url, res, parts[2], parts[3]);
@@ -314,6 +319,16 @@ async function handleRequest(deps: WebDeps, req: http.IncomingMessage, res: http
     return html(res, chartPage(url, deps.env.publicMarketApiBase));
   }
   return html(res, cachedHtml("landing", () => landingPage(deps)));
+}
+
+function isIntelRoute(pathname: string): boolean {
+  const normalized = pathname.replace(/\/+$/g, "") || "/";
+  return normalized === "/intel"
+    || normalized.startsWith("/intel/")
+    || normalized === "/admin/wallet-pnl"
+    || normalized.startsWith("/admin/wallet-pnl/")
+    || normalized === "/admin/copy-shadow"
+    || normalized.startsWith("/admin/copy-shadow/");
 }
 
 interface WalletPnlGateConfig {
@@ -443,6 +458,7 @@ async function handleIntelHome(
   const accessFailure = walletPnlIntelAccessFailure(deps, req, "/intel");
   if (accessFailure) return htmlStatus(res, accessFailure.status, accessFailure.body);
   return htmlStatus(res, 200, intelHomePage({
+    walletPnlChain: deps.env.walletPnlChain,
     walletPnlEnabled: deps.env.walletPnlEnabled
   }));
 }
@@ -498,20 +514,24 @@ async function handleWalletPnlAnalytics(
   const chain = deps.env.walletPnlChain;
   const cursor = deps.store.getWalletPnlCursor(chain);
   const snapshot = deps.store.getWalletPnlSnapshot(chain);
-  const analytics = deps.store.getWalletPnlAnalyticsSnapshot(chain);
+  const storedAnalytics = deps.store.getWalletPnlAnalyticsSnapshot(chain);
+  const staleHookAnalytics = storedAnalytics ? walletPnlAnalyticsHasIneligibleBaseV4Pool(storedAnalytics) : false;
+  const analytics = staleHookAnalytics ? undefined : storedAnalytics;
   const forceAnalyticsMaterialize = walletPnlForceAnalyticsMaterialization(url);
   const staleIgnoredTokenAnalytics = analytics ? walletPnlAnalyticsHasIgnoredToken(analytics) : false;
   const staleCreatorAnalytics = analytics ? walletPnlAnalyticsMissingTokenCreators(analytics) : false;
-  if (!analytics || forceAnalyticsMaterialize || staleIgnoredTokenAnalytics || staleCreatorAnalytics) {
+  if (!analytics || forceAnalyticsMaterialize || staleIgnoredTokenAnalytics || staleCreatorAnalytics || staleHookAnalytics) {
     walletPnlScheduleAnalyticsMaterialization(deps, chain, {
-      force: forceAnalyticsMaterialize || staleIgnoredTokenAnalytics || staleCreatorAnalytics,
+      force: forceAnalyticsMaterialize || staleIgnoredTokenAnalytics || staleCreatorAnalytics || staleHookAnalytics,
       reason: forceAnalyticsMaterialize
         ? "request-force"
         : staleIgnoredTokenAnalytics
           ? "ignored-token-cache"
-          : staleCreatorAnalytics
-            ? "token-creator-cache"
-            : "missing-cache"
+          : staleHookAnalytics
+            ? "ineligible-hook-cache"
+            : staleCreatorAnalytics
+              ? "token-creator-cache"
+              : "missing-cache"
     });
   }
   const fromBlock = snapshot?.retentionFromBlock ?? analytics?.fromBlock;
@@ -521,6 +541,7 @@ async function handleWalletPnlAnalytics(
     walletPnlPersistableClustersFromAnalytics(chain, analytics)
   );
   const common = { env: deps.env, analytics, snapshot, cursor, persistedClusters };
+  const tradeReadOptions = { trustedV4Hooks: deps.env.walletPnlTrustedV4Hooks };
 
   if (parts[0] === "tokens" && parts.length === 1) {
     return htmlStatus(res, 200, walletPnlTokensPage(common));
@@ -530,7 +551,9 @@ async function handleWalletPnlAnalytics(
     const liveNewTokens = walletPnlLiveNewTokenQueryRequested(url);
     const newTokens = liveNewTokens
       ? await walletPnlNewTokenSummaries(deps, chain, analytics)
-      : walletPnlCachedNewTokenSummaries(deps, chain);
+      : staleHookAnalytics
+        ? undefined
+        : walletPnlCachedNewTokenSummaries(deps, chain);
     return htmlStatus(res, 200, walletPnlNewTokensPage({
       ...common,
       newTokens: newTokens?.tokens,
@@ -566,7 +589,7 @@ async function handleWalletPnlAnalytics(
   if (parts[0] === "overlap" && parts.length === 1) {
     const tokenAddress = parseWalletAddress(url.searchParams.get("token"));
     const walletLimit = walletPnlQueryLimit(url, "limit", 250, 25, 1_000);
-    const tokenTrades = tokenAddress ? deps.store.getWalletPnlTradesForToken(chain, tokenAddress, fromBlock) : undefined;
+    const tokenTrades = tokenAddress ? deps.store.getWalletPnlTradesForToken(chain, tokenAddress, fromBlock, tradeReadOptions) : undefined;
     if (tokenAddress && tokenTrades) walletPnlMaybeScheduleTokenBootstrap(deps, chain, tokenAddress, tokenTrades, "overlap-token", walletPnlForceTokenBootstrap(url));
     if (tokenAddress && tokenTrades && walletPnlMissingCachedTokenWithWindowTrades(analytics, chain, tokenAddress, tokenTrades)) {
       walletPnlScheduleAnalyticsMaterialization(deps, chain, { force: true, reason: "missing-token-cache" });
@@ -581,7 +604,7 @@ async function handleWalletPnlAnalytics(
     }
     const highRoiWallets = tokenTrades ? highRoiWalletsFromSingleTokenTrades(chain, tokenTrades) : [];
     const wallets = tokenTrades ? mergeWalletSamples(highRoiWallets, topWalletsFromTrades(tokenTrades, walletLimit), walletLimit) : [];
-    const cohortTrades = wallets.length > 0 ? walletPnlTradesForWallets(deps.store, chain, wallets, fromBlock) : undefined;
+    const cohortTrades = wallets.length > 0 ? walletPnlTradesForWallets(deps.store, chain, wallets, fromBlock, tradeReadOptions) : undefined;
     const sampleWallets = historicalWalletSample(cohortTrades ?? [], wallets, url, highRoiWallets, deps.env.walletPnlHistoricalPrecomputeWalletLimit);
     const clusterKey = tokenAddress ? walletPnlHistoricalClusterKey(chain, "overlap", [tokenAddress, ...sampleWallets]) : undefined;
     return htmlStatus(res, 200, walletPnlOverlapPage({
@@ -609,7 +632,7 @@ async function handleWalletPnlAnalytics(
   if (parts[0] === "cohort" && parts.length === 1) {
     const wallets = parseWalletPnlCohortWallets(url.searchParams.get("wallets") ?? "");
     const clusterLabel = parseWalletPnlClusterLabel(url.searchParams.get("cluster"));
-    const trades = wallets.length > 0 ? walletPnlTradesForWallets(deps.store, chain, wallets, fromBlock) : [];
+    const trades = wallets.length > 0 ? walletPnlTradesForWallets(deps.store, chain, wallets, fromBlock, tradeReadOptions) : [];
     const sampleWallets = historicalWalletSample(trades, wallets, url, [], deps.env.walletPnlHistoricalPrecomputeWalletLimit);
     const clusterKey = sampleWallets.length > 0 ? walletPnlHistoricalClusterKey(chain, "cohort", sampleWallets) : undefined;
     return htmlStatus(res, 200, walletPnlCohortPage({
@@ -641,7 +664,7 @@ async function handleWalletPnlAnalytics(
   if (parts[0] === "token" && parts[1]) {
     const tokenAddress = parseWalletAddress(parts[1]);
     if (!tokenAddress) return htmlStatus(res, 400, walletPnlTokensPage(common));
-    const tokenTrades = deps.store.getWalletPnlTradesForToken(chain, tokenAddress, fromBlock);
+    const tokenTrades = deps.store.getWalletPnlTradesForToken(chain, tokenAddress, fromBlock, tradeReadOptions);
     walletPnlMaybeScheduleTokenBootstrap(deps, chain, tokenAddress, tokenTrades, "token-page", walletPnlForceTokenBootstrap(url));
     if (walletPnlMissingCachedTokenWithWindowTrades(analytics, chain, tokenAddress, tokenTrades)) {
       walletPnlScheduleAnalyticsMaterialization(deps, chain, { force: true, reason: "missing-token-cache" });
@@ -677,17 +700,21 @@ async function handleWalletPnlAnalytics(
     return htmlStatus(res, 200, walletPnlWalletDetailPage({
       ...common,
       wallet,
-      trades: deps.store.getWalletPnlTradesForWallet(chain, wallet, fromBlock)
+      trades: deps.store.getWalletPnlTradesForWallet(chain, wallet, fromBlock, tradeReadOptions)
     }));
   }
 
   if (parts[0] === "pool" && parts[1]) {
     const poolId = decodeURIComponent(parts.slice(1).join("/")).toLowerCase();
+    const pool = deps.store.getWalletPnlPool(chain, poolId);
+    if (pool && !walletPnlBaseV4HookPolicy(chain, pool.pool, deps.env.walletPnlTrustedV4Hooks).allowed) {
+      return htmlStatus(res, 404, walletPnlPoolsPage(common));
+    }
     return htmlStatus(res, 200, walletPnlPoolDetailPage({
       ...common,
       poolId,
-      pool: deps.store.getWalletPnlPool(chain, poolId),
-      trades: deps.store.getWalletPnlTradesForPool(chain, poolId, fromBlock)
+      pool,
+      trades: deps.store.getWalletPnlTradesForPool(chain, poolId, fromBlock, tradeReadOptions)
     }));
   }
 
@@ -784,11 +811,12 @@ function walletPnlTradesForWallets(
   store: Storage,
   chain: ChainSlug,
   wallets: string[],
-  fromBlock?: number
+  fromBlock?: number,
+  options?: { trustedV4Hooks?: readonly string[] }
 ): WalletPnlTradeRecord[] {
   const byKey = new Map<string, WalletPnlTradeRecord>();
   for (const wallet of wallets) {
-    for (const trade of store.getWalletPnlTradesForWallet(chain, wallet, fromBlock)) {
+    for (const trade of store.getWalletPnlTradesForWallet(chain, wallet, fromBlock, options)) {
       byKey.set(`${trade.chain}:${trade.txHash}:${trade.logIndex}:${trade.poolId}`, trade);
     }
   }
@@ -813,6 +841,7 @@ function walletPnlScheduleAnalyticsMaterialization(
   chain: ChainSlug,
   options: { force?: boolean; reason: string; delayMs?: number }
 ): void {
+  if (!deps.env.intelEnabled) return;
   const existing = deps.store.getWalletPnlAnalyticsSnapshot(chain);
   const staleIgnoredTokenAnalytics = existing ? walletPnlAnalyticsHasIgnoredToken(existing) : false;
   if (existing && !options.force && !staleIgnoredTokenAnalytics) return;
@@ -872,7 +901,7 @@ function walletPnlNewTokenSummaries(
   return enrichWalletPnlTokenSummaries({
     chain,
     tokens,
-    blockscoutClient: deps.blockscoutClient,
+    blockscoutClient: walletPnlCreatorBlockscoutClient(deps),
     rpc: deps.rpcs.get(chain),
     store: deps.store,
     deniedTokenFactoryContracts: deps.env.walletPnlDeniedTokenFactoryContracts,
@@ -888,12 +917,18 @@ function walletPnlNewTokenSummaries(
   });
 }
 
+function walletPnlCreatorBlockscoutClient(deps: WebDeps): BlockscoutClient | undefined {
+  if (!deps.env.intelEnabled) return undefined;
+  return deps.env.walletPnlBlockscoutCreatorLookupEnabled ? deps.blockscoutClient : undefined;
+}
+
 function walletPnlCachedNewTokenSummaries(
   deps: WebDeps,
   chain: ChainSlug
 ): { tokens: WalletPnlAnalyticsTokenSummary[]; toBlock: number; generatedAt: string } | undefined {
   const snapshot = deps.store.getWalletPnlNewTokensSnapshot(chain);
   if (!snapshot) return undefined;
+  if ((snapshot.hookPolicyVersion ?? 0) < WALLET_PNL_HOOK_POLICY_VERSION) return undefined;
   return { tokens: snapshot.tokens, toBlock: snapshot.toBlock, generatedAt: snapshot.generatedAt };
 }
 
@@ -930,6 +965,7 @@ function walletPnlMaybeScheduleTokenBootstrap(
   reason: string,
   force = false
 ): void {
+  if (!deps.env.intelEnabled) return;
   if (!force && tokenTrades.length > 0) return;
   deps.walletPnlIndexer?.scheduleTokenBootstrap(chain, tokenAddress, reason, force);
 }
@@ -951,7 +987,9 @@ function walletPnlMissingCachedTokenWithWindowTrades(
 }
 
 function startWalletPnlHistoricalPrecomputeHeartbeat(deps: WebDeps): NodeJS.Timeout[] {
+  if (!deps.env.intelEnabled) return [];
   if (!deps.env.walletPnlEnabled) return [];
+  if (!deps.env.walletPnlBlockscoutHistoricalBackfillEnabled) return [];
   if (deps.env.walletPnlHistoricalPrecomputeIntervalMs <= 0 || deps.env.walletPnlHistoricalPrecomputeTokenLimit <= 0) return [];
   const timers: NodeJS.Timeout[] = [];
   const startupTimer = setTimeout(() => {
@@ -973,7 +1011,9 @@ function walletPnlScheduleHistoricalPrecompute(
   chain: ChainSlug,
   options: { reason: string; delayMs?: number }
 ): void {
+  if (!deps.env.intelEnabled) return;
   if (deps.env.walletPnlHistoricalPrecomputeIntervalMs <= 0 || deps.env.walletPnlHistoricalPrecomputeTokenLimit <= 0) return;
+  if (!deps.env.walletPnlBlockscoutHistoricalBackfillEnabled) return;
   if (!deps.blockscoutClient) return;
   const key = chain;
   if (walletPnlHistoricalPrecomputes.has(key)) return;
@@ -994,8 +1034,9 @@ async function walletPnlRunHistoricalPrecompute(deps: WebDeps, chain: ChainSlug,
   const startedAt = Date.now();
   let scheduled = 0;
   let skipped = 0;
+  const tradeReadOptions = { trustedV4Hooks: deps.env.walletPnlTrustedV4Hooks };
   for (const tokenAddress of candidates) {
-    const tokenTrades = deps.store.getWalletPnlTradesForToken(chain, tokenAddress, analytics.fromBlock)
+    const tokenTrades = deps.store.getWalletPnlTradesForToken(chain, tokenAddress, analytics.fromBlock, tradeReadOptions)
       .filter((trade) => trade.blockNumber <= analytics.toBlock);
     const highRoiWallets = highRoiWalletsFromSingleTokenTrades(chain, tokenTrades);
     if (!hasHighRoiWalletTokenCohort(chain, tokenTrades) && !hasCoordinatedHighRoiEntryCluster(chain, tokenTrades)) {
@@ -1007,7 +1048,7 @@ async function walletPnlRunHistoricalPrecompute(deps: WebDeps, chain: ChainSlug,
       skipped += 1;
       continue;
     }
-    const cohortTrades = walletPnlTradesForWallets(deps.store, chain, wallets, analytics.fromBlock)
+    const cohortTrades = walletPnlTradesForWallets(deps.store, chain, wallets, analytics.fromBlock, tradeReadOptions)
       .filter((trade) => trade.blockNumber <= analytics.toBlock);
     if (!shouldBackfillOverlapCluster(analytics, chain, tokenAddress, tokenTrades, cohortTrades)) {
       skipped += 1;
@@ -1152,7 +1193,7 @@ async function walletPnlMaterializeAnalyticsSnapshot(
       : flatStore.buildWalletPnlAnalyticsSnapshotFromFlatTrades?.(flatAnalyticsOptions);
     const analytics = flatAnalytics ?? (!flatStore.buildWalletPnlAnalyticsSnapshotFromFlatTrades ? (() => {
       const trades = deps.store
-        .getWalletPnlTrades(chain, options.fromBlock)
+        .getWalletPnlTrades(chain, options.fromBlock, { trustedV4Hooks: deps.env.walletPnlTrustedV4Hooks })
         .filter((trade) => trade.blockNumber <= options.toBlock);
       if (trades.length === 0) return undefined;
       return buildWalletPnlAnalyticsSnapshot({
@@ -1176,7 +1217,7 @@ async function walletPnlMaterializeAnalyticsSnapshot(
     }
     const filteredAnalytics = await enrichWalletPnlAnalyticsTokenCreators({
       snapshot: analytics,
-      blockscoutClient: deps.blockscoutClient,
+      blockscoutClient: walletPnlCreatorBlockscoutClient(deps),
       rpc: deps.rpcs.get(chain),
       store: deps.store,
       deniedTokenFactoryContracts: deps.env.walletPnlDeniedTokenFactoryContracts,
@@ -1456,6 +1497,15 @@ async function walletPnlHistoricalTokenBuysCache(
   if (!options.forceBackfill && cached && walletPnlHistoricalCacheFresh(cached)) return cached;
 
   const now = new Date().toISOString();
+  if (!deps.env.walletPnlBlockscoutHistoricalBackfillEnabled) {
+    const disabled = walletPnlHistoricalSnapshotBase(chain, options, "disabled", now, {
+      error: "WALLET_PNL_BLOCKSCOUT_HISTORICAL_BACKFILL_ENABLED=false.",
+      sampledWalletCount: 0
+    });
+    deps.store.setWalletPnlHistoricalTokenBuys(disabled);
+    walletPnlSaveStoreLater(deps, "wallet pnl historical disabled cache");
+    return disabled;
+  }
   if (!deps.blockscoutClient) {
     const disabled = walletPnlHistoricalSnapshotBase(chain, options, "disabled", now, {
       error: "BLOCKSCOUT_API_KEY is not configured for historical token lookups."
@@ -1584,6 +1634,14 @@ async function walletPnlRunHistoricalTokenBuyBackfill(
   }
 ): Promise<void> {
   const now = new Date().toISOString();
+  if (!deps.env.walletPnlBlockscoutHistoricalBackfillEnabled) {
+    deps.store.setWalletPnlHistoricalTokenBuys(walletPnlHistoricalSnapshotBase(chain, options, "disabled", now, {
+      error: "WALLET_PNL_BLOCKSCOUT_HISTORICAL_BACKFILL_ENABLED=false.",
+      sampledWalletCount: 0
+    }));
+    await deps.store.save();
+    return;
+  }
   if (!deps.blockscoutClient) {
     deps.store.setWalletPnlHistoricalTokenBuys(walletPnlHistoricalSnapshotBase(chain, options, "disabled", now, {
       error: "BLOCKSCOUT_API_KEY is not configured for historical token lookups.",
@@ -1712,15 +1770,9 @@ function walletPnlIntelAccessFailure(_deps: WebDeps, _req: http.IncomingMessage,
 function walletPnlIntelGatePage(deps: WebDeps, returnPath: string, error?: string): string {
   const gate = walletPnlGateConfig(deps.env);
   if (!gate) {
-    return walletPnlAdminGatePage({
-      chainName: getChain(deps.env.walletPnlGateChain).name,
-      chainId: getChain(deps.env.walletPnlGateChain).chainId,
-      tokenAddress: deps.env.walletPnlGateTokenAddress ?? "not configured",
-      minBalance: deps.env.walletPnlGateMinBalance,
-      heading: "baes intel",
-      copy: "Connect with a holder wallet after WALLET_PNL_GATE_TOKEN_ADDRESS is configured.",
-      returnPath,
-      error: error ?? "Token gate is not configured."
+    return intelHomePage({
+      walletPnlChain: deps.env.walletPnlChain,
+      walletPnlEnabled: deps.env.walletPnlEnabled
     });
   }
   const chainName = getChain(gate.chain).name;
@@ -1743,7 +1795,7 @@ async function handleWalletPnlGateChallenge(
   res: http.ServerResponse
 ): Promise<void> {
   const gate = walletPnlGateConfig(deps.env);
-  if (!gate) return json(res, 404, { ok: false, error: "wallet PnL token gate is not configured" });
+  if (!gate) return json(res, 410, { ok: false, error: "wallet PnL token gate is disabled" });
   if (req.method !== "GET" && req.method !== "HEAD") {
     res.setHeader("allow", "GET");
     return json(res, 405, { ok: false, error: "unsupported method" });
@@ -1788,7 +1840,7 @@ async function handleWalletPnlGateVerify(
   res: http.ServerResponse
 ): Promise<void> {
   const gate = walletPnlGateConfig(deps.env);
-  if (!gate) return json(res, 404, { ok: false, error: "wallet PnL token gate is not configured" });
+  if (!gate) return json(res, 410, { ok: false, error: "wallet PnL token gate is disabled" });
   if (req.method !== "POST") {
     res.setHeader("allow", "POST");
     return json(res, 405, { ok: false, error: "unsupported method" });
@@ -1919,7 +1971,7 @@ async function handleCopyShadowAdmin(
     if (parsed.config.enabled && parsed.config.wallets.length > 0) {
       const snapshot = buildCopyShadowSnapshotFromConfig({
         config: parsed.config,
-        trades: deps.store.getWalletPnlTrades(parsed.config.chain)
+        trades: deps.store.getWalletPnlTrades(parsed.config.chain, undefined, { trustedV4Hooks: deps.env.walletPnlTrustedV4Hooks })
       });
       deps.store.setCopyShadowSnapshot(snapshot);
     }
@@ -2296,9 +2348,7 @@ function contentTypeForWebAsset(filePath: string): string {
 
 function preloadGeneratedSeoFiles(deps: WebDeps): void {
   sitemapBundle = readGeneratedSeoFile("sitemap.xml");
-  robotsBundle = readGeneratedSeoFile("robots.txt");
   if (sitemapBundle) deps.logger.info({ bytes: sitemapBundle.byteLength }, "sitemap cached");
-  if (robotsBundle) deps.logger.info({ bytes: robotsBundle.byteLength }, "robots.txt cached");
 }
 
 function readGeneratedSeoFile(fileName: string): Buffer | undefined {
@@ -2316,9 +2366,9 @@ function readGeneratedSeoFile(fileName: string): Buffer | undefined {
   return undefined;
 }
 
-async function handleSitemap(res: http.ServerResponse): Promise<void> {
+async function handleSitemap(res: http.ServerResponse, intelEnabled: boolean): Promise<void> {
   try {
-    const body = await generatedSitemap();
+    const body = await generatedSitemap(intelEnabled);
     return xml(res, body, 300);
   } catch {
     if (sitemapBundle) return xml(res, sitemapBundle, 300);
@@ -2326,16 +2376,17 @@ async function handleSitemap(res: http.ServerResponse): Promise<void> {
   }
 }
 
-function handleRobots(res: http.ServerResponse): void {
-  if (robotsBundle) return text(res, robotsBundle, 3600);
-  return text(res, Buffer.from(generateRobotsTxt(siteOriginFromEnv()), "utf8"), 300);
+function handleRobots(res: http.ServerResponse, intelEnabled: boolean): void {
+  return text(res, Buffer.from(generateRobotsTxt(siteOriginFromEnv(), { intelEnabled }), "utf8"), 300);
 }
 
-async function generatedSitemap(): Promise<Buffer> {
+async function generatedSitemap(intelEnabled: boolean): Promise<Buffer> {
   const now = Date.now();
-  if (generatedSitemapCache && generatedSitemapCache.expiresAt > now) return generatedSitemapCache.body;
-  const body = Buffer.from(await generateSitemapXml(), "utf8");
-  generatedSitemapCache = { expiresAt: now + SITEMAP_CACHE_TTL_MS, body };
+  if (generatedSitemapCache && generatedSitemapCache.expiresAt > now && generatedSitemapCache.intelEnabled === intelEnabled) {
+    return generatedSitemapCache.body;
+  }
+  const body = Buffer.from(await generateSitemapXml({ intelEnabled }), "utf8");
+  generatedSitemapCache = { expiresAt: now + SITEMAP_CACHE_TTL_MS, intelEnabled, body };
   return body;
 }
 
@@ -2391,7 +2442,7 @@ function findStoredPool(store: Storage, chain: ChainSlug, poolId: string): PoolK
 }
 
 function walletPnlGateConfig(env: Env): WalletPnlGateConfig | undefined {
-  if (!env.walletPnlGateTokenAddress) return undefined;
+  if (!env.walletPnlGateEnabled || !env.walletPnlGateTokenAddress) return undefined;
   return {
     chain: env.walletPnlGateChain,
     tokenAddress: env.walletPnlGateTokenAddress,
@@ -2710,6 +2761,14 @@ function solanaNotSupportedJson(res: http.ServerResponse): void {
     error: "Solana is not currently supported by baes scan",
     code: "solana_not_supported"
   });
+}
+
+function notFound(res: http.ServerResponse): void {
+  res.writeHead(404, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  res.end("<!doctype html><title>Not found</title><body>Not found.</body>");
 }
 
 function html(res: http.ServerResponse, body: string): void {

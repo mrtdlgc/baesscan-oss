@@ -43,6 +43,8 @@ const WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" as Address;
 const ARB_WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" as Address;
 const MON_WMON = "0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A" as Address;
 const MEGA_WETH = "0x4200000000000000000000000000000000000006" as Address;
+const HOOD_WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" as Address;
+const HOOD_USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" as Address;
 const WMATIC = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" as Address;
 const WAVAX = "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7" as Address;
 const BALANCER_V2_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Address;
@@ -376,6 +378,45 @@ export const CHAINS: Record<ChainSlug, ChainConfig> = {
       }
     ]
   }),
+  robinhood: evmChain({
+    slug: "robinhood",
+    name: "Robinhood Chain",
+    chainId: 4663,
+    rpcEnv: "ROBINHOOD_RPC_URLS",
+    nativeSymbol: "ETH",
+    wrappedNative: HOOD_WETH,
+    explorerBaseUrl: "https://robinhoodchain.blockscout.com",
+    geckoNetwork: "robinhood",
+    usdLikeQuotes: ["0x49D9face26A98C5e124f31FDCF387884fa659ec8"],
+    extraUsdLikeQuotes: [HOOD_USDG],
+    extraQuoteAliases: {
+      usdg: HOOD_USDG
+    },
+    dexes: [
+      {
+        dex: "uniswap",
+        label: "Uniswap",
+        protocols: ["v4", "v3", "v2"],
+        poolManagerAddress: "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+        v3FactoryAddress: "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
+        v2FactoryAddress: "0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f"
+      },
+      {
+        dex: "pancakeswap",
+        label: "PancakeSwap",
+        protocols: ["v3", "v2"],
+        v3FactoryAddress: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+        v2FactoryAddress: "0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E"
+      },
+      {
+        dex: "sushiswap",
+        label: "SushiSwap",
+        protocols: ["v3", "v2"],
+        v3FactoryAddress: "0xE51960f1B45f1C9FB6D166E6a884F866fC70433B",
+        v2FactoryAddress: "0xE52abd50ad151ecDf56427effD715E703696a6B1"
+      }
+    ]
+  }),
   polygon: evmChain({
     slug: "polygon",
     name: "Polygon PoS",
@@ -572,6 +613,8 @@ interface EvmChainInput {
   explorerBaseUrl: string;
   geckoNetwork: string;
   usdLikeQuotes: Address[];
+  // Stables that should price at $1 without claiming one of the usdc/usdt/... alias slots.
+  extraUsdLikeQuotes?: Address[];
   extraNativeLikeQuotes?: Address[];
   extraCanonicalPairTokens?: Address[];
   extraQuoteAliases?: Record<string, Address>;
@@ -593,10 +636,11 @@ function evmChain(input: EvmChainInput): ChainConfig {
   for (let i = 0; i < input.usdLikeQuotes.length && i < usdAliases.length; i++) {
     quoteAliases[usdAliases[i]!] = input.usdLikeQuotes[i]!;
   }
+  const usdLikeQuotes = uniqueQuoteList([...input.usdLikeQuotes, ...(input.extraUsdLikeQuotes ?? [])]);
   const nativeLikeQuotes = uniqueQuoteList([ZERO_ADDRESS, input.wrappedNative, ...(input.extraNativeLikeQuotes ?? [])]);
   const canonicalPairTokens = uniqueQuoteList([
     ...nativeLikeQuotes,
-    ...input.usdLikeQuotes,
+    ...usdLikeQuotes,
     ...(input.extraCanonicalPairTokens ?? [])
   ]);
   return {
@@ -604,7 +648,8 @@ function evmChain(input: EvmChainInput): ChainConfig {
     quoteAliases,
     nativeLikeQuotes,
     canonicalPairTokens,
-    ...input
+    ...input,
+    usdLikeQuotes
   };
 }
 

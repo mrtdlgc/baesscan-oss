@@ -4,6 +4,7 @@ import type { Env } from "../config/env";
 import type { Storage } from "../store/storage";
 import { welcomeText } from "./messages";
 import { notifyOwnersAboutChatAdded, notifyOwnersAboutChatRemoved } from "./ownerAlerts";
+import { migrateChatId } from "./chatMigration";
 
 interface Deps {
   env: Env;
@@ -13,6 +14,28 @@ interface Deps {
 
 export function registerLifecycle(bot: Telegraf, deps: Deps): void {
   const { env, store, logger } = deps;
+
+  // Upgrading a basic group to a supergroup changes its chat id. Telegram announces it with a
+  // service message in both chats: migrate_to_chat_id in the old one, migrate_from_chat_id in
+  // the new one. Catch either so the stored record follows the group instead of going stale.
+  bot.use(async (ctx, next) => {
+    const message = ctx.message as
+      | { migrate_to_chat_id?: number; migrate_from_chat_id?: number }
+      | undefined;
+    const chatId = ctx.chat?.id;
+    if (message && chatId !== undefined) {
+      try {
+        if (typeof message.migrate_to_chat_id === "number") {
+          await migrateChatId(store, logger, chatId, message.migrate_to_chat_id);
+        } else if (typeof message.migrate_from_chat_id === "number") {
+          await migrateChatId(store, logger, message.migrate_from_chat_id, chatId);
+        }
+      } catch (error) {
+        logger.error({ error, chatId }, "chat migration handler failed");
+      }
+    }
+    return next();
+  });
 
   // Fires when the bot's own membership in a chat changes (added, promoted, kicked, left).
   bot.on("my_chat_member", async (ctx) => {

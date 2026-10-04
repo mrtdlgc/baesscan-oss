@@ -36,6 +36,7 @@ import type { MarketTrade } from "../web/markets/types";
 import { FLAUNCH_HOOK_SWAP_TOPIC, INITIALIZE_TOPIC, SWAP_TOPIC } from "../uniswap/abis";
 import { BASE_FLAUNCH_HOOKS } from "../uniswap/constants";
 import { poolV4Hook, trustedV4Hook, untrustedV4Hook, untrustedV4HookRiskScore } from "./v4HookRisk";
+import { isUniswapV4Pool, walletPnlBaseV4HookPolicy, walletPnlTradeHookPolicy } from "./walletPnlHookPolicy";
 import { enrichWalletPnlAnalyticsTokenCreators, enrichWalletPnlTokenSummaries } from "./walletPnlCreatorDenylist";
 import { buildWalletPnlGoodSignalWallets } from "./walletPnlGoodSignal";
 
@@ -51,6 +52,7 @@ const WALLET_PNL_INITIALIZE_LOOKUP_CHUNK_BLOCKS = 100_000_000;
 const WALLET_PNL_NEW_TOKENS_LIMIT = 250;
 const WALLET_PNL_ANALYTICS_CREATOR_LOOKUP_DEADLINE_MS = 2 * 60_000;
 const WALLET_PNL_NEW_TOKENS_CREATOR_LOOKUP_DEADLINE_MS = 45_000;
+export const WALLET_PNL_HOOK_POLICY_VERSION = 1;
 const EXCLUDED_WALLET_PNL_PROTOCOLS = new Set(["balancer", "curve"]);
 
 interface WalletPnlFlatAnalyticsStore {
@@ -66,6 +68,7 @@ interface WalletPnlFlatAnalyticsStore {
     snapshotLimit: number;
     minProfitUsd: number;
     partial: boolean;
+    trustedV4Hooks?: string[];
     profile?: WalletPnlProfileSink;
   }) => WalletPnlSnapshot | undefined;
   buildWalletPnlSnapshotFromFlatTradesInWorker?: (options: {
@@ -80,6 +83,7 @@ interface WalletPnlFlatAnalyticsStore {
     snapshotLimit: number;
     minProfitUsd: number;
     partial: boolean;
+    trustedV4Hooks?: string[];
     profile?: WalletPnlProfileSink;
   }) => Promise<WalletPnlSnapshot | undefined>;
   buildWalletPnlAnalyticsSnapshotFromFlatTrades?: (options: {
@@ -134,6 +138,17 @@ interface WalletPnlRebuildBounds {
   windowBlocks: number;
   positionBlocks: number;
   partial: boolean;
+}
+
+interface WalletPnlPoolPolicyFilter {
+  pools: PoolKey[];
+  total: number;
+  rejected: number;
+  rejectedExcludedProtocol: number;
+  rejectedBaseV4NoHook: number;
+  rejectedBaseV4UntrustedHook: number;
+  rejectedFactoryV4UntrustedHook: number;
+  rejectedHooks: string[];
 }
 
 interface WalletPosition {
@@ -297,7 +312,7 @@ export class WalletPnlIndexer {
   }
 
   scheduleTokenBootstrap(chain: ChainSlug, tokenAddress: string, reason = "request", force = false): void {
-    if (!this.deps.env.walletPnlEnabled || !this.deps.env.walletPnlTokenBootstrapEnabled) return;
+    if (!this.deps.env.walletPnlEnabled || !this.deps.env.walletPnlTokenBootstrapEnabled || !this.deps.env.walletPnlBlockscoutTokenBootstrapEnabled) return;
     if (!this.deps.blockscoutClient) return;
     let token: string;
     try {
@@ -474,6 +489,7 @@ export class WalletPnlIndexer {
       snapshotLimit: this.deps.env.walletPnlSnapshotLimit,
       minProfitUsd: this.deps.env.walletPnlMinProfitUsd,
       partial: bounds.partial,
+      trustedV4Hooks: this.deps.env.walletPnlTrustedV4Hooks,
       profile: profile.sink
     });
     if (!rebuilt) {
@@ -566,7 +582,7 @@ export class WalletPnlIndexer {
     }
     rebuilt = await enrichWalletPnlAnalyticsTokenCreators({
       snapshot: rebuilt,
-      blockscoutClient: this.deps.blockscoutClient,
+      blockscoutClient: this.walletPnlCreatorBlockscoutClient(),
       rpc: this.deps.rpcs.get(chain),
       store: this.deps.store,
       deniedTokenFactoryContracts: this.deps.env.walletPnlDeniedTokenFactoryContracts,
@@ -661,7 +677,7 @@ export class WalletPnlIndexer {
       tokens: await enrichWalletPnlTokenSummaries({
         chain,
         tokens: rebuilt.tokens,
-        blockscoutClient: this.deps.blockscoutClient,
+        blockscoutClient: this.walletPnlCreatorBlockscoutClient(),
         rpc: this.deps.rpcs.get(chain),
         store: this.deps.store,
         deniedTokenFactoryContracts: this.deps.env.walletPnlDeniedTokenFactoryContracts,
@@ -717,10 +733,10 @@ export class WalletPnlIndexer {
         this.deps.env.logChunkSize,
         this.deps.env.walletPnlMaxFactoryDiscoveries
       );
-      this.upsertPools(chain, discovered, "factory", now);
+      const discoveredPoolPolicy = this.upsertPools(chain, discovered, "factory", now);
       const activeDiscovered = await this.discoverActiveBlockscoutPools(chain, fromBlock, toBlock, logger);
-      this.upsertPools(chain, activeDiscovered, "blockscout", now);
-      const pools = this.scanPools(chain);
+      const activeDiscoveredPoolPolicy = this.upsertPools(chain, activeDiscovered, "blockscout", now);
+      const pools = this.scanPools(chain, retentionFromBlock);
       if (pools.length > 0) {
         const logs = await this.fetchLogs(chain, rpc, pools, fromBlock, toBlock, logger);
         const trades = await this.normalizeTrades(chain, rpc, pools, logs, logger);
@@ -731,14 +747,34 @@ export class WalletPnlIndexer {
             toBlock,
             pools: pools.length,
             discoveredPools: discovered.length,
+            registeredDiscoveredPools: discoveredPoolPolicy.pools.length,
+            rejectedDiscoveredPools: discoveredPoolPolicy.rejected,
+            rejectedDiscoveredBaseV4NoHook: discoveredPoolPolicy.rejectedBaseV4NoHook,
+            rejectedDiscoveredBaseV4UntrustedHook: discoveredPoolPolicy.rejectedBaseV4UntrustedHook,
             activeDiscoveredPools: activeDiscovered.length,
+            registeredActiveDiscoveredPools: activeDiscoveredPoolPolicy.pools.length,
+            rejectedActiveDiscoveredPools: activeDiscoveredPoolPolicy.rejected,
+            rejectedActiveBaseV4NoHook: activeDiscoveredPoolPolicy.rejectedBaseV4NoHook,
+            rejectedActiveBaseV4UntrustedHook: activeDiscoveredPoolPolicy.rejectedBaseV4UntrustedHook,
             swapLogs: logs.length,
             walletTrades: trades.length
           },
           "wallet pnl range processed"
         );
       } else {
-        logger.info({ fromBlock, toBlock, discoveredPools: discovered.length, activeDiscoveredPools: activeDiscovered.length }, "wallet pnl range skipped; no pools registered");
+        logger.info(
+          {
+            fromBlock,
+            toBlock,
+            discoveredPools: discovered.length,
+            registeredDiscoveredPools: discoveredPoolPolicy.pools.length,
+            rejectedDiscoveredPools: discoveredPoolPolicy.rejected,
+            activeDiscoveredPools: activeDiscovered.length,
+            registeredActiveDiscoveredPools: activeDiscoveredPoolPolicy.pools.length,
+            rejectedActiveDiscoveredPools: activeDiscoveredPoolPolicy.rejected
+          },
+          "wallet pnl range skipped; no pools registered"
+        );
       }
       scannedToBlock = toBlock;
     }
@@ -777,7 +813,6 @@ export class WalletPnlIndexer {
     const filters = walletPnlTokenPoolDiscoveryFilters(chain, tokenAddress);
     if (filters.length === 0) return;
 
-    blockscout.resetBudget();
     const discoveryLogs = await blockscout.fetchLogs(
       chain,
       filters,
@@ -785,11 +820,23 @@ export class WalletPnlIndexer {
       headBlock,
       Math.max(this.deps.env.blockscoutLogChunkSize, WALLET_PNL_TOKEN_BOOTSTRAP_LOG_CHUNK_BLOCKS)
     );
-    const pools = walletPnlPoolsFromDiscoveryLogs(chain, tokenAddress, discoveryLogs)
-      .filter(isWalletPnlPool)
-      .slice(0, this.deps.env.walletPnlTokenBootstrapMaxPools);
+    const discoveredPools = walletPnlPoolsFromDiscoveryLogs(chain, tokenAddress, discoveryLogs);
+    const poolPolicy = filterWalletPnlPoolsByPolicy(chain, discoveredPools, "blockscout", this.deps.env.walletPnlTrustedV4Hooks);
+    const pools = poolPolicy.pools.slice(0, this.deps.env.walletPnlTokenBootstrapMaxPools);
     if (pools.length === 0) {
-      logger.info({ fromBlock: discoveryFromBlock, toBlock: headBlock, discoveryLogs: discoveryLogs.length }, "wallet pnl token bootstrap found no pools");
+      logger.info(
+        {
+          fromBlock: discoveryFromBlock,
+          toBlock: headBlock,
+          discoveryLogs: discoveryLogs.length,
+          discoveredPools: discoveredPools.length,
+          rejectedPools: poolPolicy.rejected,
+          rejectedBaseV4NoHook: poolPolicy.rejectedBaseV4NoHook,
+          rejectedBaseV4UntrustedHook: poolPolicy.rejectedBaseV4UntrustedHook,
+          rejectedHooks: poolPolicy.rejectedHooks
+        },
+        "wallet pnl token bootstrap found no eligible pools"
+      );
       return;
     }
 
@@ -818,13 +865,21 @@ export class WalletPnlIndexer {
         replayFromBlock,
         toBlock: headBlock,
         discoveryLogs: discoveryLogs.length,
+        discoveredPools: discoveredPools.length,
         pools: pools.length,
+        rejectedPools: poolPolicy.rejected,
+        rejectedBaseV4NoHook: poolPolicy.rejectedBaseV4NoHook,
+        rejectedBaseV4UntrustedHook: poolPolicy.rejectedBaseV4UntrustedHook,
         newlySeededPools: newlySeeded.length,
         swapLogs: swapLogs.length,
         walletTrades: trades.length
       },
       "wallet pnl token bootstrap completed"
     );
+  }
+
+  private walletPnlCreatorBlockscoutClient(): BlockscoutClient | undefined {
+    return this.deps.env.walletPnlBlockscoutCreatorLookupEnabled ? this.deps.blockscoutClient : undefined;
   }
 
   private async discoverActiveBlockscoutPools(
@@ -864,10 +919,11 @@ export class WalletPnlIndexer {
         toBlock,
         Math.max(WALLET_PNL_INITIALIZE_LOOKUP_CHUNK_BLOCKS, toBlock + 1)
       );
-      const pools = uniquePools(initializeLogs
+      const resolvedPools = uniquePools(initializeLogs
         .map((log) => parseTrackedPoolDiscoveryLog(source, log, chain))
         .filter((pool): pool is PoolKey => Boolean(pool && isWalletPnlPool(pool))))
         .filter((pool) => !this.deps.store.getWalletPnlPool(chain, pool.id.toLowerCase()));
+      const poolPolicy = filterWalletPnlPoolsByPolicy(chain, resolvedPools, "blockscout", this.deps.env.walletPnlTrustedV4Hooks);
       logger.info(
         {
           fromBlock,
@@ -875,11 +931,16 @@ export class WalletPnlIndexer {
           activeV4SwapLogs: swapLogs.length,
           unknownPoolIds: unknownPoolIds.length,
           initializeLogs: initializeLogs.length,
-          activeDiscoveredPools: pools.length
+          resolvedPools: resolvedPools.length,
+          activeDiscoveredPools: poolPolicy.pools.length,
+          rejectedPools: poolPolicy.rejected,
+          rejectedBaseV4NoHook: poolPolicy.rejectedBaseV4NoHook,
+          rejectedBaseV4UntrustedHook: poolPolicy.rejectedBaseV4UntrustedHook,
+          rejectedHooks: poolPolicy.rejectedHooks
         },
         "wallet pnl active v4 pools resolved from Blockscout"
       );
-      return pools;
+      return poolPolicy.pools;
     } catch (error) {
       logger.warn({ fromBlock, toBlock, error: (error as Error).message }, "wallet pnl active v4 pool discovery failed");
       return [];
@@ -893,13 +954,22 @@ export class WalletPnlIndexer {
     if (existing.length >= limit) return;
     const seeds = await resolveMarketPools(chain, rpc, limit);
     if (seeds.length === 0) return;
-    this.upsertPools(chain, seeds, "seed", now);
-    logger.info({ seedPools: seeds.length }, "wallet pnl seed pools registered");
+    const poolPolicy = this.upsertPools(chain, seeds, "seed", now);
+    logger.info(
+      {
+        seedPools: seeds.length,
+        registeredSeedPools: poolPolicy.pools.length,
+        rejectedSeedPools: poolPolicy.rejected,
+        rejectedBaseV4NoHook: poolPolicy.rejectedBaseV4NoHook,
+        rejectedBaseV4UntrustedHook: poolPolicy.rejectedBaseV4UntrustedHook
+      },
+      "wallet pnl seed pools registered"
+    );
   }
 
-  private upsertPools(chain: ChainSlug, pools: PoolKey[], source: WalletPnlPoolRecord["source"], now: string): void {
-    const records = uniquePools(pools)
-      .filter(isWalletPnlPool)
+  private upsertPools(chain: ChainSlug, pools: PoolKey[], source: WalletPnlPoolRecord["source"], now: string): WalletPnlPoolPolicyFilter {
+    const poolPolicy = filterWalletPnlPoolsByPolicy(chain, uniquePools(pools), source, this.deps.env.walletPnlTrustedV4Hooks);
+    const records = poolPolicy.pools
       .map((pool): WalletPnlPoolRecord => ({
         chain,
         poolId: pool.id.toLowerCase(),
@@ -911,14 +981,21 @@ export class WalletPnlIndexer {
         updatedAt: now
       }));
     this.deps.store.upsertWalletPnlPools(records);
+    return poolPolicy;
   }
 
-  private scanPools(chain: ChainSlug): PoolKey[] {
+  private scanPools(chain: ChainSlug, activeFromBlock: number): PoolKey[] {
     const limit = this.deps.env.walletPnlMaxPoolsPerTick;
-    return this.deps.store
-      .getWalletPnlPools(chain, limit > 0 ? limit : undefined)
-      .map((record) => record.pool)
-      .filter(isWalletPnlPool);
+    const records = this.deps.store
+      .getWalletPnlScanPools(chain, {
+        activeFromBlock,
+        limit: limit > 0 ? limit : undefined,
+        sources: this.deps.env.walletPnlScanPoolSources,
+        trustedV4Hooks: this.deps.env.walletPnlTrustedV4Hooks
+      });
+    return records
+      .filter((record) => shouldUseWalletPnlPool(chain, record.pool, record.source, this.deps.env.walletPnlTrustedV4Hooks))
+      .map((record) => record.pool);
   }
 
   private async fetchLogs(
@@ -929,6 +1006,24 @@ export class WalletPnlIndexer {
     toBlock: number,
     logger: Logger
   ): Promise<Log[]> {
+    const poolPolicy = filterWalletPnlPoolsByPolicy(chain, pools, "blockscout", this.deps.env.walletPnlTrustedV4Hooks);
+    if (poolPolicy.rejected > 0) {
+      logger.warn(
+        {
+          fromBlock,
+          toBlock,
+          requestedPools: pools.length,
+          eligiblePools: poolPolicy.pools.length,
+          rejectedPools: poolPolicy.rejected,
+          rejectedBaseV4NoHook: poolPolicy.rejectedBaseV4NoHook,
+          rejectedBaseV4UntrustedHook: poolPolicy.rejectedBaseV4UntrustedHook,
+          rejectedHooks: poolPolicy.rejectedHooks
+        },
+        "wallet pnl trade-log fetch skipped ineligible pools"
+      );
+    }
+    pools = poolPolicy.pools;
+    if (pools.length === 0) return [];
     const blockscout = this.deps.blockscoutClient;
     const source = this.deps.env.blockscoutLogSource;
     if (source === "preferred" && blockscout) {
@@ -1234,6 +1329,7 @@ export function buildWalletPnlAnalyticsSnapshot(options: {
   const poolsById = new Map((options.poolRecords ?? []).map((record) => [record.poolId.toLowerCase(), record.pool]));
   const orderedTrades = options.trades
     .filter((trade) => trade.chain === options.chain && trade.blockNumber >= options.fromBlock && trade.blockNumber <= options.toBlock)
+    .filter((trade) => walletPnlAnalyticsTradeAllowed(options.chain, trade, poolsById, options.trustedV4Hooks))
     .sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex);
 
   for (const trade of orderedTrades) {
@@ -1306,6 +1402,7 @@ export function buildWalletPnlAnalyticsSnapshot(options: {
   const pnlPositionTrades = options.positionFromBlock !== undefined && options.positionFromBlock < options.fromBlock
     ? options.trades
       .filter((trade) => trade.chain === options.chain && trade.blockNumber >= options.positionFromBlock! && trade.blockNumber <= options.toBlock)
+      .filter((trade) => walletPnlAnalyticsTradeAllowed(options.chain, trade, poolsById, options.trustedV4Hooks))
       .sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex)
     : orderedTrades;
   const trustedV4HookPoolIds = walletPnlTrustedV4HookPoolIds(options.poolRecords ?? [], options.trustedV4Hooks);
@@ -1327,6 +1424,7 @@ export function buildWalletPnlAnalyticsSnapshot(options: {
 
   return {
     schemaVersion: 1,
+    hookPolicyVersion: WALLET_PNL_HOOK_POLICY_VERSION,
     chain: options.chain,
     generatedAt: new Date().toISOString(),
     windowHours: options.windowHours,
@@ -1361,12 +1459,14 @@ function shouldRebuildWalletPnlAnalytics(
   }
 ): boolean {
   if (!snapshot) return true;
+  if ((snapshot.hookPolicyVersion ?? 0) < WALLET_PNL_HOOK_POLICY_VERSION) return true;
   if (snapshot.windowHours !== options.windowHours) return true;
   if (snapshot.positionWindowHours !== options.positionWindowHours) return true;
   if ((snapshot.positionFromBlock ?? snapshot.fromBlock) > options.positionFromBlock) return true;
   if (snapshot.fromBlock > options.fromBlock) return true;
   if (walletPnlAnalyticsHasIgnoredToken(snapshot)) return true;
   if (walletPnlAnalyticsMissingV4HookRisk(snapshot)) return true;
+  if (walletPnlAnalyticsHasIneligibleBaseV4Pool(snapshot)) return true;
   if (walletPnlAnalyticsMissingGoodSignal(snapshot)) return true;
   if (walletPnlAnalyticsMissingTokenCreators(snapshot)) return true;
   if (snapshot.toBlock > options.toBlock) return false;
@@ -1386,6 +1486,7 @@ function shouldRebuildWalletPnlNewTokens(
   }
 ): boolean {
   if (!snapshot) return true;
+  if ((snapshot.hookPolicyVersion ?? 0) < WALLET_PNL_HOOK_POLICY_VERSION) return true;
   if (snapshot.windowHours !== options.windowHours) return true;
   if (snapshot.fromBlock > options.fromBlock) return true;
   if (walletPnlTokenSummariesMissingCreators(snapshot.tokens)) return true;
@@ -1406,6 +1507,7 @@ function walletPnlNewTokensSnapshotFromAnalytics(
     .slice(0, Math.max(1, Math.floor(limit)));
   return {
     schemaVersion: 1,
+    hookPolicyVersion: WALLET_PNL_HOOK_POLICY_VERSION,
     chain: analytics.chain,
     generatedAt: analytics.generatedAt,
     windowHours: analytics.windowHours,
@@ -1435,6 +1537,18 @@ function walletPnlAnalyticsMissingV4HookRisk(snapshot: WalletPnlAnalyticsSnapsho
   return Boolean(
     snapshot.tokens.some((token) => token.protocols.includes("v4") && token.untrustedV4HookCount === undefined) ||
     snapshot.pools.some((pool) => pool.protocol === "v4" && pool.untrustedV4Hook === undefined)
+  );
+}
+
+export function walletPnlAnalyticsHasIneligibleBaseV4Pool(snapshot: WalletPnlAnalyticsSnapshot): boolean {
+  if ((snapshot.hookPolicyVersion ?? 0) < WALLET_PNL_HOOK_POLICY_VERSION) return true;
+  return snapshot.pools.some((pool) =>
+    pool.dex === "uniswap" &&
+    pool.protocol === "v4" &&
+    (!pool.v4Hook || pool.untrustedV4Hook === true)
+  ) || snapshot.tokens.some((token) =>
+    token.protocols.includes("v4") &&
+    (token.untrustedV4HookCount ?? 0) > 0
   );
 }
 
@@ -1469,6 +1583,7 @@ function shouldRebuildWalletPnlSnapshot(
   }
 ): boolean {
   if (!snapshot) return true;
+  if ((snapshot.hookPolicyVersion ?? 0) < WALLET_PNL_HOOK_POLICY_VERSION) return true;
   if (snapshot.positionWindowHours !== options.positionWindowHours) return true;
   if (snapshot.windowHours !== options.windowHours || snapshot.retentionDays !== options.retentionDays) return true;
   if ((snapshot.positionFromBlock ?? snapshot.retentionFromBlock) > options.positionFromBlock) return true;
@@ -1586,6 +1701,16 @@ function walletPnlTrustedV4HookPoolIds(
     out.add(record.poolId.toLowerCase());
   }
   return out;
+}
+
+function walletPnlAnalyticsTradeAllowed(
+  chain: ChainSlug,
+  trade: WalletPnlTradeRecord,
+  poolsById: ReadonlyMap<string, PoolKey>,
+  trustedV4Hooks?: readonly string[]
+): boolean {
+  const pool = poolsById.get(trade.poolId.toLowerCase());
+  return walletPnlTradeHookPolicy(chain, trade, pool, trustedV4Hooks).allowed;
 }
 
 function buildAnalyticsPnlLeaders(
@@ -2073,6 +2198,7 @@ function buildWalletPnlSnapshot(options: {
 
   return {
     schemaVersion: 1,
+    hookPolicyVersion: WALLET_PNL_HOOK_POLICY_VERSION,
     chain: options.chain,
     generatedAt: new Date().toISOString(),
     windowHours: options.windowHours,
@@ -2162,6 +2288,63 @@ function tokenAddress(token: TokenMetadata): string {
 
 function isWalletPnlPool(pool: PoolKey): boolean {
   return !EXCLUDED_WALLET_PNL_PROTOCOLS.has(poolProtocol(pool));
+}
+
+function filterWalletPnlPoolsByPolicy(
+  chain: ChainSlug,
+  pools: PoolKey[],
+  source: WalletPnlPoolRecord["source"],
+  trustedV4Hooks?: readonly string[]
+): WalletPnlPoolPolicyFilter {
+  const rejectedHooks = new Set<string>();
+  const out: WalletPnlPoolPolicyFilter = {
+    pools: [],
+    total: pools.length,
+    rejected: 0,
+    rejectedExcludedProtocol: 0,
+    rejectedBaseV4NoHook: 0,
+    rejectedBaseV4UntrustedHook: 0,
+    rejectedFactoryV4UntrustedHook: 0,
+    rejectedHooks: []
+  };
+  for (const pool of pools) {
+    const decision = walletPnlBaseV4HookPolicy(chain, pool, trustedV4Hooks);
+    if (!isWalletPnlPool(pool)) {
+      out.rejected += 1;
+      out.rejectedExcludedProtocol += 1;
+      continue;
+    }
+    if (!decision.allowed) {
+      out.rejected += 1;
+      if (decision.reason === "missing-base-v4-hook") out.rejectedBaseV4NoHook += 1;
+      if (decision.reason === "untrusted-base-v4-hook") out.rejectedBaseV4UntrustedHook += 1;
+      if (decision.hook) rejectedHooks.add(decision.hook);
+      continue;
+    }
+    if (source === "factory" && isUniswapV4Pool(pool) && !trustedV4Hook(pool, trustedV4Hooks)) {
+      out.rejected += 1;
+      out.rejectedFactoryV4UntrustedHook += 1;
+      const hook = poolV4Hook(pool);
+      if (hook) rejectedHooks.add(hook);
+      continue;
+    }
+    out.pools.push(pool);
+  }
+  out.rejectedHooks = [...rejectedHooks].sort().slice(0, 8);
+  return out;
+}
+
+function shouldUseWalletPnlPool(
+  chain: ChainSlug,
+  pool: PoolKey,
+  source: WalletPnlPoolRecord["source"],
+  trustedV4Hooks?: readonly string[]
+): boolean {
+  if (!isWalletPnlPool(pool)) return false;
+  if (!walletPnlBaseV4HookPolicy(chain, pool, trustedV4Hooks).allowed) return false;
+  if (source !== "factory") return true;
+  if (!isUniswapV4Pool(pool)) return true;
+  return Boolean(trustedV4Hook(pool, trustedV4Hooks));
 }
 
 function tokenSymbol(token: TokenMetadata): string {

@@ -361,7 +361,7 @@ export function walletPnlNewTokensPage(options: AnalyticsPageOptions): string {
           <span class="source-pill">${escapeText(sourceLabel)}</span>
           <a class="admin-sort-chip" href="/intel/wallet-pnl/tokens">Volume tokens</a>
         </div>
-        <p class="admin-inline-note">This is not a live deployment-discovery feed. It is a token-gated ${escapeText(analysisCadence)} cache for reviewing newly surfaced tokens, wallet clusters, and early risk signals from the retained wallet-PnL ledger.</p>
+        <p class="admin-inline-note">This is not a live deployment-discovery feed. It is a public ${escapeText(analysisCadence)} cache for reviewing newly surfaced tokens, wallet clusters, and early risk signals from the retained wallet-PnL ledger.</p>
         <div class="table-scroll">
           <table class="dex-table admin-wallet-table">
             <thead>
@@ -1129,7 +1129,6 @@ function analyticsShell(options: {
           ${navLink("/intel/wallet-pnl/pools", "U", "Pools", options.active === "pools" || options.active === "pool")}
           ${navLink("/intel/wallet-pnl/status", "S", "Status", options.active === "status")}
           ${navLink("/", "B", "Buybot", false)}
-          ${navLink("/intel/wallet-pnl?logout=1", "L", "Logout", false)}
         </nav>
         <div class="side-block">
           <p>Status</p>
@@ -1162,7 +1161,7 @@ function analyticsShell(options: {
       </div>
     </div>
   `, {
-    description: `${options.heading} for baes intel: token-gated wallet PnL, New Tokens, risk clusters, and retained-window DEX flow on ${chainName}.`,
+    description: `${options.heading} for baes intel: wallet PnL, New Tokens, risk clusters, and retained-window DEX flow on ${chainName}.`,
     canonicalPath: options.active === "new-tokens"
       ? "/intel/wallet-pnl/tokens/new"
       : options.active === "signals"
@@ -1213,7 +1212,7 @@ function renderAnalyticsSummary(options: AnalyticsPageOptions): string {
           <span class="source-pill${analytics ? "" : " is-warning"}">${analytics ? "Ready" : "Waiting"}</span>
         </div>
         <p>${analytics
-          ? `Generated ${escapeText(formatDateTime(analytics.generatedAt))}. Rows here are derived once from retained normalized trades, then reused by the gated pages.`
+          ? `Generated ${escapeText(formatDateTime(analytics.generatedAt))}. Rows here are derived once from retained normalized trades, then reused by the intel pages.`
           : "Run the wallet PnL indexer once to materialize token, wallet, and pool analytics."}</p>
       </div>
       <dl class="admin-metrics">

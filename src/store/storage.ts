@@ -47,6 +47,17 @@ export interface SwapArchiveChunkRecord {
 
 export type WalletPnlPoolSource = "factory" | "seed" | "blockscout";
 
+export interface WalletPnlPoolScanOptions {
+  limit?: number;
+  activeFromBlock?: number;
+  sources?: readonly WalletPnlPoolSource[];
+  trustedV4Hooks?: readonly string[];
+}
+
+export interface WalletPnlTradeReadOptions {
+  trustedV4Hooks?: readonly string[];
+}
+
 export interface WalletPnlPoolRecord {
   chain: ChainSlug;
   poolId: string;
@@ -123,6 +134,7 @@ export interface WalletPnlWalletSummary {
 
 export interface WalletPnlSnapshot {
   schemaVersion: 1;
+  hookPolicyVersion?: number;
   chain: ChainSlug;
   generatedAt: string;
   windowHours: number;
@@ -275,6 +287,7 @@ export interface WalletPnlAnalyticsSignalWallet {
 
 export interface WalletPnlAnalyticsSnapshot {
   schemaVersion: 1;
+  hookPolicyVersion?: number;
   chain: ChainSlug;
   generatedAt: string;
   windowHours?: number;
@@ -297,6 +310,7 @@ export interface WalletPnlAnalyticsSnapshot {
 
 export interface WalletPnlNewTokensSnapshot {
   schemaVersion: 1;
+  hookPolicyVersion?: number;
   chain: ChainSlug;
   generatedAt: string;
   windowHours?: number;
@@ -542,14 +556,15 @@ export interface Storage {
   getSwapArchiveChunks(chain: ChainSlug, limit?: number): SwapArchiveChunkRecord[];
   upsertWalletPnlPools(records: WalletPnlPoolRecord[]): void;
   getWalletPnlPools(chain: ChainSlug, limit?: number): WalletPnlPoolRecord[];
+  getWalletPnlScanPools(chain: ChainSlug, options?: WalletPnlPoolScanOptions): WalletPnlPoolRecord[];
   getWalletPnlTokenCreator(chain: ChainSlug, tokenAddress: string): WalletPnlTokenCreatorRecord | undefined;
   upsertWalletPnlTokenCreators(records: WalletPnlTokenCreatorRecord[]): void;
   upsertWalletPnlTrades(records: WalletPnlTradeRecord[]): void;
   pruneWalletPnlTradesBeforeBlock(chain: ChainSlug, beforeBlock: number): number;
-  getWalletPnlTrades(chain: ChainSlug, fromBlock?: number): WalletPnlTradeRecord[];
-  getWalletPnlTradesForToken(chain: ChainSlug, tokenAddress: string, fromBlock?: number): WalletPnlTradeRecord[];
-  getWalletPnlTradesForWallet(chain: ChainSlug, wallet: string, fromBlock?: number): WalletPnlTradeRecord[];
-  getWalletPnlTradesForPool(chain: ChainSlug, poolId: string, fromBlock?: number): WalletPnlTradeRecord[];
+  getWalletPnlTrades(chain: ChainSlug, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[];
+  getWalletPnlTradesForToken(chain: ChainSlug, tokenAddress: string, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[];
+  getWalletPnlTradesForWallet(chain: ChainSlug, wallet: string, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[];
+  getWalletPnlTradesForPool(chain: ChainSlug, poolId: string, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[];
   getWalletPnlPool(chain: ChainSlug, poolId: string): WalletPnlPoolRecord | undefined;
   getWalletPnlCursor(chain: ChainSlug): WalletPnlCursor | undefined;
   setWalletPnlCursor(cursor: WalletPnlCursor): void;

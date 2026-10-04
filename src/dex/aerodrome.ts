@@ -4,7 +4,7 @@ import type { Address, ChainSlug, PoolKey } from "../types";
 import type { DexDeployment } from "../chains/registry";
 import { isSameAddress, normalizeAddress } from "../utils/address";
 import { BASE_AERODROME_POOL_FACTORY } from "../uniswap/constants";
-import { getLogsInChunks, type DiscoverPoolsOptions } from "./uniswap";
+import { getDiscoveryLogs, type DiscoverPoolsOptions } from "./uniswap";
 import { buildTokenPairFilters, poolContainsSelection } from "./common";
 
 export const AERODROME_FACTORY_ABI = [
@@ -50,13 +50,10 @@ export async function discoverAerodromePools(rpc: RpcPool, opts: DiscoverPoolsOp
 
   for (const filter of filters) {
     if (shouldStop()) break;
-    await getLogsInChunks(
+    await getDiscoveryLogs(
       rpc,
+      opts,
       filter,
-      opts.fromBlock,
-      opts.toBlock,
-      opts.chunkSize,
-      opts.onProgress,
       async (log: Log) => {
         const pool = parseAerodromePoolCreatedLog(log, deployment?.dex ?? "aerodrome");
         if (pool) await addPool(pool);

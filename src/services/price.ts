@@ -2,6 +2,7 @@ import { formatUnits } from "ethers";
 import type { ChainSlug, TokenId } from "../types";
 import { getChain } from "../chains/registry";
 import type { RpcPool } from "./rpcPool";
+import type { DexscreenerClient, DexscreenerMarket } from "./dexscreener";
 
 const NATIVE_COINGECKO_IDS: Partial<Record<ChainSlug, string>> = {
   ethereum: "ethereum",
@@ -9,8 +10,9 @@ const NATIVE_COINGECKO_IDS: Partial<Record<ChainSlug, string>> = {
   arbitrum: "ethereum",
   optimism: "ethereum",
   megaeth: "ethereum",
+  robinhood: "ethereum",
   bsc: "binancecoin",
-  polygon: "matic-network",
+  polygon: "polygon-ecosystem-token",
   avalanche: "avalanche-2",
   solana: "solana"
 };
@@ -34,7 +36,9 @@ const NATIVE_PRICE_CACHE_MS = 60_000;
 const DEFAULT_STALE_NATIVE_PRICE_MS = 60 * 60_000;
 const MAX_CHAINLINK_PRICE_AGE_MS = 24 * 60 * 60_000;
 const TOKEN_PRICE_CACHE_MS = 60_000;
-const BASE_VIRTUAL = "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b";
+/** Tokens with no USD source are common, so cache the miss instead of refetching per swap. */
+const TOKEN_PRICE_MISS_CACHE_MS = 5 * 60_000;
+const MAX_TOKEN_PRICE_CACHE_ENTRIES = 5_000;
 
 interface CachedNativeUsd {
   value: number;
@@ -42,9 +46,17 @@ interface CachedNativeUsd {
   staleUntil: number;
 }
 
+interface CachedTokenUsd {
+  /** Undefined records a known miss: the token has no USD price source. */
+  value?: number;
+  expiresAt: number;
+  staleUntil: number;
+}
+
 export class PriceService {
   private nativeUsdCache = new Map<ChainSlug, CachedNativeUsd>();
-  private tokenUsdCache = new Map<string, CachedNativeUsd>();
+  private tokenUsdCache = new Map<string, CachedTokenUsd>();
+  private tokenUsdInflight = new Map<string, Promise<number | undefined>>();
   private chainlinkDecimalsCache = new Map<ChainSlug, number>();
 
   constructor(private readonly opts: {
@@ -52,6 +64,7 @@ export class PriceService {
     disableCoinGecko: boolean;
     rpcs?: Map<ChainSlug, RpcPool>;
     staleNativeUsdMs?: number;
+    dexscreener?: DexscreenerClient;
   }) {}
 
   async quoteUsdMultiplier(quoteAddress: TokenId, chain: ChainSlug = "base"): Promise<number | undefined> {
@@ -59,8 +72,18 @@ export class PriceService {
     const key = quoteAddress.toLowerCase();
     if (chainConfig.usdLikeQuotes.map((value) => value.toLowerCase()).includes(key)) return 1;
     if (chainConfig.nativeLikeQuotes.map((value) => value.toLowerCase()).includes(key)) return this.getNativeUsd(chain);
-    if (chain === "base" && key === BASE_VIRTUAL) return this.getTokenUsd(chain, key);
-    return undefined;
+    return this.getTokenUsd(chain, key);
+  }
+
+  /**
+   * Market cap and FDV for a tracked token, from Dexscreener. Market cap is absent
+   * whenever Dexscreener does not report one, so callers should fall back to FDV.
+   */
+  async marketValuation(
+    chain: ChainSlug,
+    opts: { tokenAddress: string; pairId?: string }
+  ): Promise<DexscreenerMarket | undefined> {
+    return this.opts.dexscreener?.getMarketForPool(chain, opts);
   }
 
   private async getTokenUsd(chain: ChainSlug, address: string): Promise<number | undefined> {
@@ -68,19 +91,58 @@ export class PriceService {
     const now = Date.now();
     const cached = this.tokenUsdCache.get(cacheKey);
     if (cached && cached.expiresAt > now) return cached.value;
-    if (!this.opts.disableCoinGecko) {
-      const coingeckoValue = await this.fetchCoinGeckoTokenUsd(chain, address);
-      if (coingeckoValue !== undefined) {
-        this.tokenUsdCache.set(cacheKey, {
-          value: coingeckoValue,
-          expiresAt: now + TOKEN_PRICE_CACHE_MS,
-          staleUntil: now + (this.opts.staleNativeUsdMs ?? DEFAULT_STALE_NATIVE_PRICE_MS)
-        });
-        return coingeckoValue;
-      }
+
+    // Market scans price one quote token per pool, so collapse concurrent lookups.
+    const pending = this.tokenUsdInflight.get(cacheKey);
+    if (pending) return pending;
+    const request = this.resolveTokenUsd(chain, address, cacheKey, cached, now).finally(() => {
+      this.tokenUsdInflight.delete(cacheKey);
+    });
+    this.tokenUsdInflight.set(cacheKey, request);
+    return request;
+  }
+
+  private async resolveTokenUsd(
+    chain: ChainSlug,
+    address: string,
+    cacheKey: string,
+    cached: CachedTokenUsd | undefined,
+    now: number
+  ): Promise<number | undefined> {
+    // Dexscreener first: it covers long-tail tokens and newer chains that CoinGecko
+    // has no asset platform for, and its rate limits are far looser.
+    const fetched =
+      (await this.opts.dexscreener?.getTokenUsdPrice(chain, address)) ??
+      (this.opts.disableCoinGecko ? undefined : await this.fetchCoinGeckoTokenUsd(chain, address));
+
+    if (fetched !== undefined) {
+      this.cacheTokenUsd(cacheKey, {
+        value: fetched,
+        expiresAt: now + TOKEN_PRICE_CACHE_MS,
+        staleUntil: now + (this.opts.staleNativeUsdMs ?? DEFAULT_STALE_NATIVE_PRICE_MS)
+      });
+      return fetched;
     }
-    if (cached && cached.staleUntil > now) return cached.value;
+
+    if (cached?.value !== undefined && cached.staleUntil > now) {
+      // Serve the last known price, but hold off on retrying every single swap.
+      this.cacheTokenUsd(cacheKey, { ...cached, expiresAt: now + TOKEN_PRICE_MISS_CACHE_MS });
+      return cached.value;
+    }
+
+    this.cacheTokenUsd(cacheKey, { expiresAt: now + TOKEN_PRICE_MISS_CACHE_MS, staleUntil: 0 });
     return undefined;
+  }
+
+  private cacheTokenUsd(cacheKey: string, entry: CachedTokenUsd): void {
+    this.tokenUsdCache.delete(cacheKey);
+    this.tokenUsdCache.set(cacheKey, entry);
+    if (this.tokenUsdCache.size <= MAX_TOKEN_PRICE_CACHE_ENTRIES) return;
+    for (const key of this.tokenUsdCache.keys()) {
+      if (this.tokenUsdCache.size <= MAX_TOKEN_PRICE_CACHE_ENTRIES) break;
+      if (key === cacheKey) continue;
+      this.tokenUsdCache.delete(key);
+    }
   }
 
   private async getNativeUsd(chain: ChainSlug): Promise<number | undefined> {

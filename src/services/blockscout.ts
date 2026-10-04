@@ -52,10 +52,16 @@ interface V2LogResult {
   block_hash?: string;
 }
 
+interface V2CollectionPayload {
+  items?: unknown[];
+  next_page_params?: Record<string, unknown> | null;
+}
+
 type BlockscoutLogResult = EtherscanLogResult | V2LogResult;
 
 const BLOCKSCOUT_CONTRACT_CREATION_BATCH_SIZE = 5;
 const BLOCKSCOUT_TOKEN_TRANSFER_LIMIT = 1_000;
+const BLOCKSCOUT_REST_PAGE_LIMIT = 50;
 
 export interface BlockscoutContractCreationRecord {
   contractAddress: string;
@@ -70,9 +76,12 @@ export interface BlockscoutTokenTransferRecord {
   decimals?: number;
   from?: string;
   to?: string;
+  fromIsContract?: boolean;
+  toIsContract?: boolean;
   valueRaw?: string;
   txHash?: string;
   blockNumber?: number;
+  logIndex?: number;
   timestamp?: string;
 }
 
@@ -80,6 +89,7 @@ export class BlockscoutClient {
   private requestCount = 0;
   private requestWindowStartedAt = Date.now();
   private lastRequestAt = 0;
+  private requestQueue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly options: BlockscoutClientOptions) {}
 
@@ -96,8 +106,7 @@ export class BlockscoutClient {
   }
 
   resetBudget(): void {
-    this.requestCount = 0;
-    this.requestWindowStartedAt = Date.now();
+    this.resetBudgetWindowIfExpired(Date.now());
   }
 
   async fetchContractCreations(chain: ChainSlug, addresses: string[]): Promise<BlockscoutContractCreationRecord[]> {
@@ -151,30 +160,51 @@ export class BlockscoutClient {
     });
   }
 
+  async fetchTokenTransfers(options: {
+    chain: ChainSlug;
+    tokenAddress: string;
+    pageLimit?: number;
+  }): Promise<BlockscoutTokenTransferRecord[]> {
+    const chainId = getChain(options.chain).chainId;
+    if (!chainId) throw new Error(`Blockscout token transfer lookup requires an EVM chain id for ${options.chain}`);
+    const pageLimit = Math.min(20, Math.max(1, Math.floor(options.pageLimit ?? 4)));
+    const items = await this.queryV2Paginated(chainId, `tokens/${options.tokenAddress.toLowerCase()}/transfers`, pageLimit);
+    return items.map(blockscoutTokenTransferRecord).filter((record): record is BlockscoutTokenTransferRecord => Boolean(record));
+  }
+
+  async fetchTransactionLogs(chain: ChainSlug, txHash: string): Promise<Log[]> {
+    const chainId = getChain(chain).chainId;
+    if (!chainId) throw new Error(`Blockscout transaction logs require an EVM chain id for ${chain}`);
+    const items = await this.queryV2Paginated(chainId, `transactions/${txHash.toLowerCase()}/logs`, 10);
+    return items
+      .map((result) => blockscoutLogToEthersLog(result as BlockscoutLogResult, ""))
+      .filter((log): log is Log => Boolean(log));
+  }
+
   private async queryContractCreations(chainId: number, addresses: string[]): Promise<BlockscoutContractCreationRecord[]> {
     if (addresses.length === 0) return [];
-    this.chargeRequestBudget();
-    await this.delayIfNeeded();
-    const url = new URL(this.options.apiBaseUrl);
-    url.searchParams.set("chain_id", String(chainId));
-    url.searchParams.set("module", "contract");
-    url.searchParams.set("action", "getcontractcreation");
-    url.searchParams.set("contractaddresses", addresses.join(","));
-    url.searchParams.set("apikey", this.options.apiKey);
+    return this.runQueuedRequest(async () => {
+      const url = new URL(this.options.apiBaseUrl);
+      url.searchParams.set("chain_id", String(chainId));
+      url.searchParams.set("module", "contract");
+      url.searchParams.set("action", "getcontractcreation");
+      url.searchParams.set("contractaddresses", addresses.join(","));
+      url.searchParams.set("apikey", this.options.apiKey);
 
-    const response = await fetch(url, { headers: { accept: "application/json" } });
-    const text = await response.text();
-    const payload = parseBlockscoutPayload(text);
-    if (!response.ok) {
-      throw new Error(`Blockscout contract creation failed ${response.status}: ${blockscoutMessage(payload)}`);
-    }
-    const items = Array.isArray(payload.result) ? payload.result : [];
-    if (payload.status === "0" && items.length === 0) {
-      const message = blockscoutMessage(payload);
-      if (/not found|no records|no contract/i.test(message)) return [];
-      throw new Error(`Blockscout contract creation returned status=0: ${message}`);
-    }
-    return items.map(blockscoutContractCreationRecord).filter((record): record is BlockscoutContractCreationRecord => Boolean(record));
+      const response = await fetch(url, { headers: { accept: "application/json" } });
+      const text = await response.text();
+      const payload = parseBlockscoutPayload(text);
+      if (!response.ok) {
+        throw new Error(`Blockscout contract creation failed ${response.status}: ${blockscoutMessage(payload)}`);
+      }
+      const items = Array.isArray(payload.result) ? payload.result : [];
+      if (payload.status === "0" && items.length === 0) {
+        const message = blockscoutMessage(payload);
+        if (/not found|no records|no contract/i.test(message)) return [];
+        throw new Error(`Blockscout contract creation returned status=0: ${message}`);
+      }
+      return items.map(blockscoutContractCreationRecord).filter((record): record is BlockscoutContractCreationRecord => Boolean(record));
+    });
   }
 
   private async queryTokenTransfers(options: {
@@ -184,36 +214,71 @@ export class BlockscoutClient {
     endBlock?: number;
     limit: number;
   }): Promise<BlockscoutTokenTransferRecord[]> {
-    this.chargeRequestBudget();
-    await this.delayIfNeeded();
-    const url = new URL(this.options.apiBaseUrl);
-    url.searchParams.set("chain_id", String(options.chainId));
-    url.searchParams.set("module", "account");
-    url.searchParams.set("action", "tokentx");
-    url.searchParams.set("address", options.address);
-    if (options.startBlock !== undefined) url.searchParams.set("startblock", String(options.startBlock));
-    if (options.endBlock !== undefined) url.searchParams.set("endblock", String(options.endBlock));
-    url.searchParams.set("page", "1");
-    url.searchParams.set("offset", String(options.limit));
-    url.searchParams.set("sort", "desc");
-    url.searchParams.set("apikey", this.options.apiKey);
+    return this.runQueuedRequest(async () => {
+      const url = new URL(this.options.apiBaseUrl);
+      url.searchParams.set("chain_id", String(options.chainId));
+      url.searchParams.set("module", "account");
+      url.searchParams.set("action", "tokentx");
+      url.searchParams.set("address", options.address);
+      if (options.startBlock !== undefined) url.searchParams.set("startblock", String(options.startBlock));
+      if (options.endBlock !== undefined) url.searchParams.set("endblock", String(options.endBlock));
+      url.searchParams.set("page", "1");
+      url.searchParams.set("offset", String(options.limit));
+      url.searchParams.set("sort", "desc");
+      url.searchParams.set("apikey", this.options.apiKey);
 
-    const response = await fetch(url, { headers: { accept: "application/json" } });
-    const text = await response.text();
-    const payload = parseBlockscoutPayload(text);
-    if (!response.ok) {
-      throw new Error(`Blockscout token transfers failed ${response.status}: ${blockscoutMessage(payload)}`);
+      const response = await fetch(url, { headers: { accept: "application/json" } });
+      const text = await response.text();
+      const payload = parseBlockscoutPayload(text);
+      if (!response.ok) {
+        throw new Error(`Blockscout token transfers failed ${response.status}: ${blockscoutMessage(payload)}`);
+      }
+      const items = Array.isArray(payload.result)
+        ? payload.result
+        : Array.isArray(payload.items)
+          ? payload.items
+          : [];
+      if (items.length === 0 && typeof payload.message === "string" && /no transactions|no records|no token/i.test(payload.message)) return [];
+      if (payload.status === "0" && items.length === 0 && payload.message && !/no transactions|no records|no token/i.test(String(payload.message))) {
+        throw new Error(`Blockscout token transfers returned status=0: ${blockscoutMessage(payload)}`);
+      }
+      return items.map(blockscoutTokenTransferRecord).filter((record): record is BlockscoutTokenTransferRecord => Boolean(record));
+    });
+  }
+
+  private async queryV2Paginated(chainId: number, path: string, pageLimit: number): Promise<unknown[]> {
+    const items: unknown[] = [];
+    let nextPageParams: Record<string, string> | undefined;
+    for (let page = 0; page < pageLimit; page++) {
+      const payload = await this.queryV2Collection(chainId, path, nextPageParams);
+      if (Array.isArray(payload.items)) items.push(...payload.items);
+      nextPageParams = nextPageParamsFromPayload(payload);
+      if (!nextPageParams) break;
     }
-    const items = Array.isArray(payload.result)
-      ? payload.result
-      : Array.isArray(payload.items)
-        ? payload.items
-        : [];
-    if (items.length === 0 && typeof payload.message === "string" && /no transactions|no records|no token/i.test(payload.message)) return [];
-    if (payload.status === "0" && items.length === 0 && payload.message && !/no transactions|no records|no token/i.test(String(payload.message))) {
-      throw new Error(`Blockscout token transfers returned status=0: ${blockscoutMessage(payload)}`);
-    }
-    return items.map(blockscoutTokenTransferRecord).filter((record): record is BlockscoutTokenTransferRecord => Boolean(record));
+    return items;
+  }
+
+  private async queryV2Collection(chainId: number, path: string, pageParams?: Record<string, string>): Promise<V2CollectionPayload> {
+    return this.runQueuedRequest(async () => {
+      const url = this.v2RestUrl(chainId, path);
+      url.searchParams.set("apikey", this.options.apiKey);
+      if (pageParams) {
+        for (const [key, value] of Object.entries(pageParams)) url.searchParams.set(key, value);
+      }
+
+      const response = await fetch(url, { headers: { accept: "application/json" } });
+      const text = await response.text();
+      const payload = parseBlockscoutPayload(text);
+      if (!response.ok) {
+        throw new Error(`Blockscout REST request failed ${response.status}: ${blockscoutMessage(payload)}`);
+      }
+      return payload as V2CollectionPayload;
+    });
+  }
+
+  private v2RestUrl(chainId: number, path: string): URL {
+    const base = blockscoutV2RestBaseUrl(this.options.apiBaseUrl, chainId);
+    return new URL(path.replace(/^\/+/g, ""), base);
   }
 
   private async fetchLogsForFilter(chainId: number, filter: BlockscoutLogFilter, fromBlock: number, toBlock: number, chunkSize: number): Promise<Log[]> {
@@ -241,41 +306,54 @@ export class BlockscoutClient {
   }
 
   private async queryLogs(chainId: number, filter: BlockscoutLogFilter, fromBlock: number, toBlock: number): Promise<BlockscoutLogResult[]> {
-    this.chargeRequestBudget();
-    await this.delayIfNeeded();
-    const url = new URL(this.options.apiBaseUrl);
-    url.searchParams.set("chain_id", String(chainId));
-    url.searchParams.set("module", "logs");
-    url.searchParams.set("action", "getLogs");
-    url.searchParams.set("fromBlock", String(fromBlock));
-    url.searchParams.set("toBlock", String(toBlock));
-    url.searchParams.set("address", filter.address);
-    url.searchParams.set("topic0", filter.topic0);
-    const topicFields = [1, 2, 3] as const;
-    for (const index of topicFields) {
-      const topic = filter[`topic${index}`];
-      if (!topic) continue;
-      url.searchParams.set(`topic${index}`, topic);
-      url.searchParams.set(`topic0_${index}_opr`, "and");
-    }
-    url.searchParams.set("apikey", this.options.apiKey);
+    return this.runQueuedRequest(async () => {
+      const url = new URL(this.options.apiBaseUrl);
+      url.searchParams.set("chain_id", String(chainId));
+      url.searchParams.set("module", "logs");
+      url.searchParams.set("action", "getLogs");
+      url.searchParams.set("fromBlock", String(fromBlock));
+      url.searchParams.set("toBlock", String(toBlock));
+      url.searchParams.set("address", filter.address);
+      url.searchParams.set("topic0", filter.topic0);
+      const topicFields = [1, 2, 3] as const;
+      for (const index of topicFields) {
+        const topic = filter[`topic${index}`];
+        if (!topic) continue;
+        url.searchParams.set(`topic${index}`, topic);
+        url.searchParams.set(`topic0_${index}_opr`, "and");
+      }
+      url.searchParams.set("apikey", this.options.apiKey);
 
-    const response = await fetch(url, { headers: { accept: "application/json" } });
-    const text = await response.text();
-    const payload = parseBlockscoutPayload(text);
-    if (!response.ok) {
-      throw new Error(`Blockscout logs failed ${response.status}: ${blockscoutMessage(payload)}`);
-    }
-    const items = Array.isArray(payload.result)
-      ? payload.result
-      : Array.isArray(payload.items)
-        ? payload.items
-        : [];
-    if (items.length === 0 && typeof payload.message === "string" && /no logs|no records/i.test(payload.message)) return [];
-    if (payload.status === "0" && items.length === 0 && payload.message && !/no logs|no records/i.test(String(payload.message))) {
-      throw new Error(`Blockscout logs returned status=0: ${blockscoutMessage(payload)}`);
-    }
-    return items as BlockscoutLogResult[];
+      const response = await fetch(url, { headers: { accept: "application/json" } });
+      const text = await response.text();
+      const payload = parseBlockscoutPayload(text);
+      if (!response.ok) {
+        throw new Error(`Blockscout logs failed ${response.status}: ${blockscoutMessage(payload)}`);
+      }
+      const items = Array.isArray(payload.result)
+        ? payload.result
+        : Array.isArray(payload.items)
+          ? payload.items
+          : [];
+      if (items.length === 0 && typeof payload.message === "string" && /no logs|no records/i.test(payload.message)) return [];
+      if (payload.status === "0" && items.length === 0 && payload.message && !/no logs|no records/i.test(String(payload.message))) {
+        throw new Error(`Blockscout logs returned status=0: ${blockscoutMessage(payload)}`);
+      }
+      return items as BlockscoutLogResult[];
+    });
+  }
+
+  private async runQueuedRequest<T>(request: () => Promise<T>): Promise<T> {
+    const run = this.requestQueue.then(async () => {
+      this.chargeRequestBudget();
+      await this.delayIfNeeded();
+      return request();
+    });
+    this.requestQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
   }
 
   private async delayIfNeeded(): Promise<void> {
@@ -289,14 +367,17 @@ export class BlockscoutClient {
 
   private chargeRequestBudget(): void {
     const now = Date.now();
-    if (now - this.requestWindowStartedAt > 60_000) {
-      this.requestCount = 0;
-      this.requestWindowStartedAt = now;
-    }
+    this.resetBudgetWindowIfExpired(now);
     this.requestCount += 1;
     if (this.requestCount > this.options.maxRequestsPerTick) {
       throw new Error(`Blockscout request budget exceeded (${this.options.maxRequestsPerTick})`);
     }
+  }
+
+  private resetBudgetWindowIfExpired(now: number): void {
+    if (now - this.requestWindowStartedAt <= 60_000) return;
+    this.requestCount = 0;
+    this.requestWindowStartedAt = now;
   }
 }
 
@@ -418,6 +499,8 @@ function blockscoutTokenTransferRecord(value: unknown): BlockscoutTokenTransferR
     ?? stringValue(raw.transaction_hash)
     ?? objectHash(raw.transaction);
   const timestamp = parseBlockscoutTimestamp(raw.timeStamp ?? raw.timestamp);
+  const from = raw.from && typeof raw.from === "object" ? raw.from as Record<string, unknown> : undefined;
+  const to = raw.to && typeof raw.to === "object" ? raw.to as Record<string, unknown> : undefined;
   return {
     tokenAddress: tokenAddress.toLowerCase(),
     tokenSymbol: stringValue(raw.tokenSymbol) ?? stringValue(raw.token_symbol) ?? stringValue(token?.symbol),
@@ -425,9 +508,12 @@ function blockscoutTokenTransferRecord(value: unknown): BlockscoutTokenTransferR
     decimals: parseBlockscoutNumber(raw.tokenDecimal ?? raw.token_decimal ?? token?.decimals ?? total?.decimals),
     from: objectHash(raw.from)?.toLowerCase(),
     to: objectHash(raw.to)?.toLowerCase(),
+    fromIsContract: typeof from?.is_contract === "boolean" ? from.is_contract : undefined,
+    toIsContract: typeof to?.is_contract === "boolean" ? to.is_contract : undefined,
     valueRaw: stringValue(raw.value) ?? stringValue(total?.value),
     txHash: txHash?.toLowerCase(),
     blockNumber: parseBlockscoutNumber(raw.blockNumber ?? raw.block_number),
+    logIndex: parseBlockscoutNumber(raw.logIndex ?? raw.log_index),
     timestamp
   };
 }
@@ -474,6 +560,28 @@ function parseBlockscoutPayload(text: string): Record<string, unknown> {
   } catch {
     throw new Error(`Blockscout logs returned non-JSON response: ${text.slice(0, 120) || "empty response body"}`);
   }
+}
+
+function nextPageParamsFromPayload(payload: V2CollectionPayload): Record<string, string> | undefined {
+  const raw = payload.next_page_params;
+  if (!raw || typeof raw !== "object") return undefined;
+  const entries = Object.entries(raw)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => [key, String(value)] as const);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function blockscoutV2RestBaseUrl(apiBaseUrl: string, chainId: number): URL {
+  const configured = new URL(apiBaseUrl);
+  if (configured.hostname === "api.blockscout.com") {
+    return new URL(`/${chainId}/api/v2/`, configured.origin);
+  }
+
+  const path = configured.pathname.replace(/\/+$/g, "");
+  if (path.endsWith("/api/v2")) return new URL(`${path}/`, configured.origin);
+  if (path.endsWith("/api")) return new URL(`${path}/v2/`, configured.origin);
+  if (path.endsWith("/v2/api")) return new URL("/api/v2/", configured.origin);
+  return new URL("/api/v2/", configured.origin);
 }
 
 function blockscoutMessage(payload: Record<string, unknown>): string {

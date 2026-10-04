@@ -6,6 +6,7 @@ export type ChainSlug =
   | "bsc"
   | "monad"
   | "megaeth"
+  | "robinhood"
   | "solana"
   | "arbitrum"
   | "optimism"
@@ -140,6 +141,8 @@ export interface BuyEvent {
   quoteUsd?: number;
   priceUsd?: number;
   fdvUsd?: number;
+  /** Circulating market cap when a market data source reports one; preferred over FDV in alerts. */
+  marketCapUsd?: number;
   buyerEthBalance?: number;
   buyer?: string;
   sender?: string;

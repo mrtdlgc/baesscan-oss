@@ -3,7 +3,7 @@ import type { RpcPool } from "../services/rpcPool";
 import type { Address, ChainSlug, PoolKey } from "../types";
 import type { DexDeployment } from "../chains/registry";
 import { addressToTopic, isSameAddress, normalizeAddress } from "../utils/address";
-import { getLogsInChunks, type DiscoverPoolsOptions } from "./uniswap";
+import { getDiscoveryLogs, type DiscoverPoolsOptions } from "./uniswap";
 import { poolContainsSelection } from "./common";
 
 export const LB_FACTORY_ABI = [
@@ -46,13 +46,10 @@ export async function discoverLiquidityBookPools(rpc: RpcPool, opts: DiscoverPoo
 
   for (const filter of buildLbPairFilters(factory, token, quote)) {
     if (shouldStop()) break;
-    await getLogsInChunks(
+    await getDiscoveryLogs(
       rpc,
+      opts,
       filter,
-      opts.fromBlock,
-      opts.toBlock,
-      opts.chunkSize,
-      opts.onProgress,
       async (log: Log) => {
         const pool = parseLbPairCreatedLog(log, opts.dexDeployment?.dex ?? "traderjoe");
         if (pool) await addPool(pool);

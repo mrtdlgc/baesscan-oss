@@ -52,6 +52,7 @@ const RPC_FALLBACKS: Partial<Record<ChainSlug, string[]>> = {
   optimism: ["https://mainnet.optimism.io", "https://optimism.publicnode.com"],
   monad: ["https://rpc1.monad.xyz", "https://rpc3.monad.xyz", "https://rpc.monad.xyz", "https://monad-mainnet.drpc.org"],
   megaeth: ["https://mainnet.megaeth.com/rpc"],
+  robinhood: ["https://rpc.mainnet.chain.robinhood.com"],
   polygon: ["https://polygon.drpc.org", "https://polygon-bor-rpc.publicnode.com", "https://polygon.api.onfinality.io/public"],
   avalanche: ["https://api.avax.network/ext/bc/C/rpc", "https://avalanche-c-chain-rpc.publicnode.com", "https://1rpc.io/avax/c"],
   solana: ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
@@ -114,6 +115,16 @@ const CASES: LiveCase[] = [
   evm("megaeth", "kumbaya", "v3", "Kumbaya USDm/WETH", "0x587F6eeAFC7AD567e96ED1B62775Fa6402164B22", "0x68b34591f662508076927803c567Cc8006988a09"),
   evm("megaeth", "prism", "v3", "Prism USDm/WETH", "0xC2fAc0b5b6C075819e654BcfBbBcda2838609d32", "0x1adb8f973373505bB206e0E5D87af8FB1f5514Ef"),
   evm("megaeth", "noxa", "v3", "Noxa USDm/WETH", "0x4B183a49963F98B3C8fFb4a7e9248DeFC278Cd95", "0x1201EB5081eabc99b23DD952C1BFA5ea090d8779", 250_000, 50_000),
+
+  // Robinhood Chain runs ~100ms blocks, so a normal-time window needs a much larger lookback.
+  evm("robinhood", "uniswap", "v4", "Uniswap v4 WETH/USDG", "0x54f7883914619af9105355bf83ed678bcf9f63560218ac61c9963b9503d0ba32", undefined, 250_000, 5_000),
+  evm("robinhood", "uniswap", "v3", "Uniswap v3 USDG/WETH", "0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca", "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA", 250_000, 5_000),
+  evm("robinhood", "uniswap", "v2", "Uniswap v2 VIRTUAL/WETH", "0xd95e8e2Cd04c207625C6F23c974d365a5F3A91D3", "0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f", 250_000, 5_000),
+  evm("robinhood", "pancakeswap", "v3", "PancakeSwap v3 USDG/WETH", "0x88A8E96E7785d378825e8B5D7FC0e6f62487061E", "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865", 250_000, 5_000),
+  evm("robinhood", "pancakeswap", "v2", "PancakeSwap v2 WETH/USDG", "0xb535c95B61440EEB62a8a83a333A983fa712Bc86", "0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E", 250_000, 5_000),
+  evm("robinhood", "sushiswap", "v3", "SushiSwap v3 FLAMINGO/WETH", "0xd3944D05aeed7De88a987901625B8EA39241163f", "0xE51960f1B45f1C9FB6D166E6a884F866fC70433B", 250_000, 5_000),
+  // SushiSwap v2 is the thinnest Robinhood route, so it needs a much wider window to see a swap at all.
+  evm("robinhood", "sushiswap", "v2", "SushiSwap v2 GR/WETH", "0x1D41A7824963735b8be3751D528148583eDD3252", "0xE52abd50ad151ecDf56427effD715E703696a6B1", 900_000, 300_000),
 
   evm("polygon", "uniswap", "v3", "Uniswap v3 USDC/WPOL", "0xB6e57ed85c4c9dbfEF2a68711e9d6f36c56e0FcB", "0x1F98431c8aD98523631AE4a59f267346ea31F984"),
   evm("polygon", "quickswap", "algebra", "QuickSwap Algebra USDC/WPOL", "0x6669B4706cC152F359e947BCa68E263A87c52634", "0x411b0fAcC3489691f28ad58c47006AF5E3Ab3A28", 250_000, 5_000),

@@ -4,6 +4,7 @@ import { getAddress } from "ethers";
 import type { Address, ChainSlug } from "../types";
 import { CHAIN_SLUGS, CHAINS, getChain, isChainSlug, poolManagerFor } from "../chains/registry";
 import type { StorageBackend } from "../store/store";
+import type { WalletPnlPoolSource } from "../store/storage";
 
 dotenv.config();
 
@@ -202,6 +203,19 @@ function parseWalletPnlDeniedTokenFactoryContracts(): Address[] {
   return out;
 }
 
+function parseWalletPnlScanPoolSources(): WalletPnlPoolSource[] {
+  const allowed = new Set<WalletPnlPoolSource>(["factory", "seed", "blockscout"]);
+  const configured = csvStrings("WALLET_PNL_SCAN_POOL_SOURCES");
+  const selected = configured.length > 0 ? configured : ["seed", "factory", "blockscout"];
+  const out: WalletPnlPoolSource[] = [];
+  for (const value of selected) {
+    const source = value.toLowerCase() as WalletPnlPoolSource;
+    if (!allowed.has(source)) throw new Error(`Invalid WALLET_PNL_SCAN_POOL_SOURCES entry: ${value}`);
+    if (!out.includes(source)) out.push(source);
+  }
+  return out;
+}
+
 function decimalString(name: string, fallback: string): string {
   const raw = process.env[name]?.trim() || fallback;
   if (!/^\d+(?:\.\d+)?$/.test(raw)) throw new Error(`Invalid decimal env var ${name}: ${raw}`);
@@ -258,11 +272,13 @@ export interface Env {
   storageBackend: StorageBackend;
   ethUsdOverride?: number;
   disableCoinGecko: boolean;
+  disableDexscreener: boolean;
   brandName: string;
   supportUrl?: string;
   webEnabled: boolean;
   webPort: number;
   webAdminPassword?: string;
+  intelEnabled: boolean;
   intelSessionSecret?: string;
   geckoPoolLookup: boolean;
   solanaSignatureLimit: number;
@@ -305,6 +321,7 @@ export interface Env {
   walletPnlPostThreadId?: number;
   walletPnlMaxBlocksPerTick: number;
   walletPnlMaxPoolsPerTick: number;
+  walletPnlScanPoolSources: WalletPnlPoolSource[];
   walletPnlBlockLookupConcurrency: number;
   walletPnlTxLookupConcurrency: number;
   walletPnlMetadataTimeoutMs: number;
@@ -318,11 +335,15 @@ export interface Env {
   walletPnlActivePoolDiscoveryEnabled: boolean;
   walletPnlActivePoolDiscoveryMaxPools: number;
   walletPnlTokenBootstrapEnabled: boolean;
+  walletPnlBlockscoutTokenBootstrapEnabled: boolean;
+  walletPnlBlockscoutCreatorLookupEnabled: boolean;
+  walletPnlBlockscoutHistoricalBackfillEnabled: boolean;
   walletPnlTokenBootstrapDiscoveryDays: number;
   walletPnlTokenBootstrapReplayHours: number;
   walletPnlTokenBootstrapMaxPools: number;
   walletPnlTrustedV4Hooks: Address[];
   walletPnlDeniedTokenFactoryContracts: Address[];
+  walletPnlGateEnabled: boolean;
   walletPnlGateChain: ChainSlug;
   walletPnlGateTokenAddress?: Address;
   walletPnlGateMinBalance: string;
@@ -413,6 +434,7 @@ export function loadEnv(): Env {
 
   const baseRpcUrl = baseRpcUrls[0] ?? rpcUrlsByChain[primaryChain]?.[0] ?? "";
   const marketsEnabled = bool("MARKETS_ENABLED", false);
+  const intelEnabled = bool("INTEL_ENABLED", true);
   const walletPnlRetentionDays = Math.min(30, Math.max(1, num("WALLET_PNL_RETENTION_DAYS", 3)));
   const walletPnlWindowHours = Math.min(walletPnlRetentionDays * 24, Math.max(1, num("WALLET_PNL_WINDOW_HOURS", 24)));
   const walletPnlPositionWindowHours = Math.min(
@@ -423,9 +445,13 @@ export function loadEnv(): Env {
     walletPnlRetentionDays * 24,
     Math.max(1, num("WALLET_PNL_ANALYTICS_WINDOW_HOURS", walletPnlWindowHours))
   );
-  const walletPnlChain = parseWalletPnlChain();
-  const walletPnlGateTokenAddress = optionalConfigAddress("WALLET_PNL_GATE_TOKEN_ADDRESS");
+  const walletPnlChain = intelEnabled ? parseWalletPnlChain() : primaryChain;
+  const walletPnlEnabled = intelEnabled && bool("WALLET_PNL_ENABLED", false);
+  const walletPnlGateEnabled = intelEnabled && bool("WALLET_PNL_GATE_ENABLED", false);
+  const walletPnlGateTokenAddress = walletPnlGateEnabled ? optionalConfigAddress("WALLET_PNL_GATE_TOKEN_ADDRESS") : undefined;
   const walletPnlGateChain = walletPnlGateTokenAddress ? parseWalletPnlGateChain(walletPnlChain) : walletPnlChain;
+  const walletPnlGateMinBalance = walletPnlGateEnabled ? decimalString("WALLET_PNL_GATE_MIN_BALANCE", "1") : "1";
+  const walletPnlGateSessionHours = walletPnlGateEnabled ? Math.min(24, Math.max(1, num("WALLET_PNL_GATE_SESSION_HOURS", 6))) : 6;
   if (walletPnlGateTokenAddress && !enabledChains.includes(walletPnlGateChain)) {
     throw new Error("WALLET_PNL_GATE_CHAIN must be included in ENABLED_CHAINS.");
   }
@@ -464,11 +490,13 @@ export function loadEnv(): Env {
     storageBackend,
     ethUsdOverride: optionalNum("ETH_USD_OVERRIDE"),
     disableCoinGecko: bool("DISABLE_COINGECKO", false),
+    disableDexscreener: bool("DISABLE_DEXSCREENER", false),
     brandName: str("BRAND_NAME", "baes scan"),
     supportUrl: process.env.SUPPORT_URL?.trim() || undefined,
     webEnabled: bool("WEB_ENABLED", true),
     webPort: num("PORT", num("WEB_PORT", 3000)),
     webAdminPassword: process.env.WEB_ADMIN_PASSWORD?.trim() || undefined,
+    intelEnabled,
     intelSessionSecret: process.env.INTEL_SESSION_SECRET?.trim() || undefined,
     geckoPoolLookup: bool("GECKO_POOL_LOOKUP", true),
     solanaSignatureLimit: Math.min(50, Math.max(1, num("SOLANA_SIGNATURE_LIMIT", 20))),
@@ -491,7 +519,7 @@ export function loadEnv(): Env {
     marketArchiveMaxPoolsPerTick: Math.min(10_000, Math.max(0, num("MARKET_ARCHIVE_MAX_POOLS_PER_TICK", 0))),
     marketArchiveMaxFactoryDiscoveries: Math.min(10_000, Math.max(1, num("MARKET_ARCHIVE_MAX_FACTORY_DISCOVERIES", 1_000))),
     marketArchiveChunkTradeLimit: Math.min(25_000, Math.max(500, num("MARKET_ARCHIVE_CHUNK_TRADE_LIMIT", num("MARKET_ARCHIVE_CHUNK_LOG_LIMIT", 5_000)))),
-    walletPnlEnabled: bool("WALLET_PNL_ENABLED", false),
+    walletPnlEnabled,
     walletPnlChain,
     walletPnlRetentionDays,
     walletPnlWindowHours,
@@ -510,7 +538,8 @@ export function loadEnv(): Env {
     walletPnlPostChatId: optionalNum("WALLET_PNL_POST_CHAT_ID"),
     walletPnlPostThreadId: optionalNum("WALLET_PNL_POST_THREAD_ID"),
     walletPnlMaxBlocksPerTick: Math.min(100_000, Math.max(100, num("WALLET_PNL_MAX_BLOCKS_PER_TICK", 1_000))),
-    walletPnlMaxPoolsPerTick: Math.min(100_000, Math.max(0, num("WALLET_PNL_MAX_POOLS_PER_TICK", 0))),
+    walletPnlMaxPoolsPerTick: Math.min(100_000, Math.max(0, num("WALLET_PNL_MAX_POOLS_PER_TICK", 5_000))),
+    walletPnlScanPoolSources: parseWalletPnlScanPoolSources(),
     walletPnlBlockLookupConcurrency: Math.min(64, Math.max(1, num("WALLET_PNL_BLOCK_LOOKUP_CONCURRENCY", 8))),
     walletPnlTxLookupConcurrency: Math.min(64, Math.max(1, num("WALLET_PNL_TX_LOOKUP_CONCURRENCY", 16))),
     walletPnlMetadataTimeoutMs: Math.min(60_000, Math.max(1_000, num("WALLET_PNL_METADATA_TIMEOUT_MS", 10_000))),
@@ -521,21 +550,28 @@ export function loadEnv(): Env {
     walletPnlSeedPoolLimit: Math.min(500, Math.max(0, num("WALLET_PNL_SEED_POOL_LIMIT", 50))),
     walletPnlMaxFactoryDiscoveries: Math.min(10_000, Math.max(1, num("WALLET_PNL_MAX_FACTORY_DISCOVERIES", 1_000))),
     walletPnlMaxPostLagBlocks: Math.min(100_000, Math.max(0, num("WALLET_PNL_MAX_POST_LAG_BLOCKS", 3_600))),
-    walletPnlActivePoolDiscoveryEnabled: bool("WALLET_PNL_ACTIVE_POOL_DISCOVERY_ENABLED", Boolean(process.env.BLOCKSCOUT_API_KEY?.trim())),
+    walletPnlActivePoolDiscoveryEnabled: intelEnabled && bool("WALLET_PNL_ACTIVE_POOL_DISCOVERY_ENABLED", Boolean(process.env.BLOCKSCOUT_API_KEY?.trim())),
     walletPnlActivePoolDiscoveryMaxPools: Math.min(250, Math.max(1, Math.floor(num("WALLET_PNL_ACTIVE_POOL_DISCOVERY_MAX_POOLS", 25)))),
-    walletPnlTokenBootstrapEnabled: bool("WALLET_PNL_TOKEN_BOOTSTRAP_ENABLED", Boolean(process.env.BLOCKSCOUT_API_KEY?.trim())),
+    walletPnlTokenBootstrapEnabled: intelEnabled && bool("WALLET_PNL_TOKEN_BOOTSTRAP_ENABLED", Boolean(process.env.BLOCKSCOUT_API_KEY?.trim())),
+    walletPnlBlockscoutTokenBootstrapEnabled: intelEnabled && bool(
+      "WALLET_PNL_BLOCKSCOUT_TOKEN_BOOTSTRAP_ENABLED",
+      bool("WALLET_PNL_TOKEN_BOOTSTRAP_ENABLED", Boolean(process.env.BLOCKSCOUT_API_KEY?.trim()))
+    ),
+    walletPnlBlockscoutCreatorLookupEnabled: intelEnabled && bool("WALLET_PNL_BLOCKSCOUT_CREATOR_LOOKUP_ENABLED", Boolean(process.env.BLOCKSCOUT_API_KEY?.trim())),
+    walletPnlBlockscoutHistoricalBackfillEnabled: intelEnabled && bool("WALLET_PNL_BLOCKSCOUT_HISTORICAL_BACKFILL_ENABLED", Boolean(process.env.BLOCKSCOUT_API_KEY?.trim())),
     walletPnlTokenBootstrapDiscoveryDays: Math.min(365, Math.max(1, num("WALLET_PNL_TOKEN_BOOTSTRAP_DISCOVERY_DAYS", 30))),
     walletPnlTokenBootstrapReplayHours: Math.min(walletPnlRetentionDays * 24, Math.max(1, num("WALLET_PNL_TOKEN_BOOTSTRAP_REPLAY_HOURS", Math.max(24, walletPnlAnalyticsWindowHours)))),
     walletPnlTokenBootstrapMaxPools: Math.min(250, Math.max(1, Math.floor(num("WALLET_PNL_TOKEN_BOOTSTRAP_MAX_POOLS", 25)))),
-    walletPnlTrustedV4Hooks: parseWalletPnlTrustedV4Hooks(),
-    walletPnlDeniedTokenFactoryContracts: parseWalletPnlDeniedTokenFactoryContracts(),
+    walletPnlTrustedV4Hooks: intelEnabled ? parseWalletPnlTrustedV4Hooks() : [],
+    walletPnlDeniedTokenFactoryContracts: intelEnabled ? parseWalletPnlDeniedTokenFactoryContracts() : [],
+    walletPnlGateEnabled,
     walletPnlGateChain,
     walletPnlGateTokenAddress,
-    walletPnlGateMinBalance: decimalString("WALLET_PNL_GATE_MIN_BALANCE", "1"),
-    walletPnlGateSessionHours: Math.min(24, Math.max(1, num("WALLET_PNL_GATE_SESSION_HOURS", 6))),
-    copyShadowEnabled: bool("COPY_SHADOW_ENABLED", false),
-    copyShadowChain: parseCopyShadowChain(),
-    copyShadowWallets: parseCopyShadowWallets(),
+    walletPnlGateMinBalance,
+    walletPnlGateSessionHours,
+    copyShadowEnabled: intelEnabled && bool("COPY_SHADOW_ENABLED", false),
+    copyShadowChain: intelEnabled ? parseCopyShadowChain() : primaryChain,
+    copyShadowWallets: intelEnabled ? parseCopyShadowWallets() : [],
     copyShadowIntervalMs: Math.min(15 * 60_000, Math.max(30_000, num("COPY_SHADOW_INTERVAL_MS", 60_000))),
     copyShadowTradeSizeUsd: Math.min(10_000, Math.max(1, num("COPY_SHADOW_TRADE_SIZE_USD", 25))),
     copyShadowMaxPositionUsd: Math.min(100_000, Math.max(1, num("COPY_SHADOW_MAX_POSITION_USD", 100))),
@@ -551,8 +587,8 @@ export function loadEnv(): Env {
     blockscoutLogSource: parseBlockscoutLogSource(),
     blockscoutLogChunkSize: Math.min(100_000, Math.max(1, num("BLOCKSCOUT_LOG_CHUNK_SIZE", 5_000))),
     blockscoutMaxLogsPerRequest: Math.min(100_000, Math.max(1, num("BLOCKSCOUT_MAX_LOGS_PER_REQUEST", 1_000))),
-    blockscoutMaxRequestsPerTick: Math.min(10_000, Math.max(1, num("BLOCKSCOUT_MAX_REQUESTS_PER_TICK", 200))),
-    blockscoutRequestDelayMs: Math.min(10_000, Math.max(0, num("BLOCKSCOUT_REQUEST_DELAY_MS", 250))),
+    blockscoutMaxRequestsPerTick: Math.min(10_000, Math.max(1, num("BLOCKSCOUT_MAX_REQUESTS_PER_TICK", 60))),
+    blockscoutRequestDelayMs: Math.min(10_000, Math.max(0, num("BLOCKSCOUT_REQUEST_DELAY_MS", 1_000))),
     r2AccountId: process.env.R2_ACCOUNT_ID?.trim() || undefined,
     r2AccessKeyId: process.env.R2_ACCESS_KEY_ID?.trim() || undefined,
     r2SecretAccessKey: process.env.R2_SECRET_ACCESS_KEY?.trim() || undefined,

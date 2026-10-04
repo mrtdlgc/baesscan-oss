@@ -98,8 +98,22 @@ a:hover { color: var(--accent-hover); text-decoration: underline; }
   color: rgba(255,255,255,.72);
   font: 800 13px/1 var(--font-heading);
 }
+.site-footer-links {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.site-footer-github,
 .site-footer-blockscout {
   color: #ffffff;
+}
+.site-footer-github {
+  font: 800 13px/1 var(--font-heading);
+}
+.site-footer-github:hover {
+  color: #ffffff;
+  text-decoration: underline;
 }
 .site-footer-blockscout span {
   color: rgba(255,255,255,.62);

@@ -15,7 +15,7 @@ import {
   V3_POOL_ABI,
   V3_POOL_CREATED_TOPIC
 } from "../uniswap/abis";
-import { getLogsInChunks, type DiscoverPoolsOptions } from "./uniswap";
+import { getDiscoveryLogs, type DiscoverPoolsOptions } from "./uniswap";
 import { buildTokenPairFilters, poolContainsSelection } from "./common";
 
 export async function discoverPancakePools(rpc: RpcPool, opts: DiscoverPoolsOptions): Promise<PoolKey[]> {
@@ -73,13 +73,10 @@ async function discoverPancakeV3Pools(
   const filters = buildTokenPairFilters(factory, V3_POOL_CREATED_TOPIC, token, quote);
   for (const filter of filters) {
     if (shouldStop()) break;
-    await getLogsInChunks(
+    await getDiscoveryLogs(
       rpc,
+      opts,
       filter,
-      opts.fromBlock,
-      opts.toBlock,
-      opts.chunkSize,
-      opts.onProgress,
       async (log: Log) => {
         const pool = parsePancakeV3PoolCreatedLog(log, dex);
         if (pool) await addPool(pool);
@@ -103,13 +100,10 @@ async function discoverPancakeV2Pools(
   const filters = buildTokenPairFilters(factory, V2_PAIR_CREATED_TOPIC, token, quote);
   for (const filter of filters) {
     if (shouldStop()) break;
-    await getLogsInChunks(
+    await getDiscoveryLogs(
       rpc,
+      opts,
       filter,
-      opts.fromBlock,
-      opts.toBlock,
-      opts.chunkSize,
-      opts.onProgress,
       async (log: Log) => {
         const pool = parsePancakeV2PairCreatedLog(log, dex);
         if (pool) await addPool(pool);

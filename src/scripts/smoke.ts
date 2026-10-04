@@ -1,6 +1,6 @@
 import { CHAINS, CHAIN_SLUGS, PUBLIC_CHAIN_SLUGS } from "../chains/registry";
 
-const required = new Set(["ethereum", "bsc", "monad", "megaeth", "arbitrum", "optimism", "base", "polygon", "avalanche"]);
+const required = new Set(["ethereum", "bsc", "monad", "megaeth", "robinhood", "arbitrum", "optimism", "base", "polygon", "avalanche"]);
 const missing = [...required].filter((slug) => !CHAIN_SLUGS.includes(slug as typeof CHAIN_SLUGS[number]));
 if (missing.length > 0) throw new Error(`missing chain configs: ${missing.join(", ")}`);
 

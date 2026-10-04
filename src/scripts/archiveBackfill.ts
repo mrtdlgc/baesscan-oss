@@ -6,6 +6,7 @@ import { createBackfillRpcPool } from "../services/backfillRpc";
 import { BlockscoutClient } from "../services/blockscout";
 import { MarketArchiveIndexer, type MarketArchiveBackfillProgress, type MarketArchiveBackfillSummary } from "../services/marketArchive";
 import { PriceService } from "../services/price";
+import { DexscreenerClient } from "../services/dexscreener";
 import { R2SnapshotStore } from "../services/r2Snapshots";
 import { RpcPool } from "../services/rpcPool";
 import { createStorage } from "../store/store";
@@ -53,7 +54,12 @@ async function main(): Promise<void> {
       rpcs.set(chain, rpc);
     }
 
-    const priceService = new PriceService({ ethUsdOverride: env.ethUsdOverride, disableCoinGecko: env.disableCoinGecko, rpcs });
+    const priceService = new PriceService({
+      ethUsdOverride: env.ethUsdOverride,
+      disableCoinGecko: env.disableCoinGecko,
+      rpcs,
+      dexscreener: new DexscreenerClient({ enabled: !env.disableDexscreener })
+    });
     const blockscoutClient = BlockscoutClient.fromEnv(env, logger);
     if (env.blockscoutLogSource !== "disabled" && !blockscoutClient) {
       logLine("Blockscout fallback requested but BLOCKSCOUT_API_KEY is not configured", { source: env.blockscoutLogSource });

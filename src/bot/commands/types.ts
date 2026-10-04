@@ -1,5 +1,6 @@
 import type { Logger } from "pino";
 import type { Env } from "../../config/env";
+import type { BlockscoutClient } from "../../services/blockscout";
 import type { PriceService } from "../../services/price";
 import type { RpcPool } from "../../services/rpcPool";
 import type { TokenService } from "../../services/token";
@@ -12,6 +13,7 @@ export interface CommandDeps {
   rpcs: Map<ChainSlug, RpcPool>;
   store: Storage;
   tokenServices: Map<ChainSlug, TokenService>;
+  blockscoutClient?: BlockscoutClient;
   solanaClient?: SolanaRpcClient;
   priceService: PriceService;
   env: Env;

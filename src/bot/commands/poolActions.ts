@@ -32,6 +32,8 @@ export async function addPoolById(ctx: Context, deps: CommandDeps, chain: ChainS
     fromBlock,
     toBlock,
     chunkSize: deps.env.logChunkSize,
+    blockscoutClient: deps.blockscoutClient,
+    logger: deps.logger,
     onProgress: reporter.onProgress
   });
   await reporter.finish(pool ? 1 : 0);

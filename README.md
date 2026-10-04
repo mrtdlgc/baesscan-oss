@@ -8,7 +8,7 @@ This repository is the alpha self-hosted/BYOK edition. You supply the Telegram b
 
 ## What is baes scan?
 
-A multi-chain Telegram buy-alert bot plus an optional web/intel surface. Pool discovery reads raw factory and PoolManager logs through your own RPC; GeckoTerminal is used only as an embedded chart frame.
+A multi-chain Telegram buy-alert bot plus an optional web/intel surface. Pool discovery reads raw factory and PoolManager logs through your own RPC; with `BLOCKSCOUT_API_KEY` set, `/watch` and `/scan` first look for pools through Blockscout's indexed token transfers and fall back to the raw RPC scan. Buy alerts show market cap from Dexscreener when it is available and on-chain FDV otherwise. Dexscreener (with CoinGecko as a fallback) also prices quote tokens that are neither stablecoins nor the chain's native asset (`DISABLE_DEXSCREENER=true` turns Dexscreener off). GeckoTerminal is used only as an embedded chart frame.
 
 Supported coverage:
 
@@ -21,6 +21,7 @@ Supported coverage:
 | Optimism | Uniswap v2/v3/v4, Velodrome, Curve |
 | Monad | Uniswap v2/v3/v4, PancakeSwap v3, Trader Joe LB/v2 |
 | MegaETH | Kumbaya v3, Prism v3, Noxa v3 |
+| Robinhood Chain | Uniswap v2/v3/v4, PancakeSwap v2/v3, SushiSwap v2/v3 |
 | Polygon | Uniswap v3, QuickSwap Algebra/v2, SushiSwap v2, Curve, Balancer |
 | Avalanche | Uniswap v3, Pharaoh v3, Blackhole v3, Trader Joe LB/v2, Pangolin v2, SushiSwap v2, Curve, Balancer |
 
@@ -34,7 +35,6 @@ Hosted [baesscan.com](https://baesscan.com) provides:
 - Blockscout-backed discovery and recovery
 - background wallet-PnL materialization
 - no hosting or backfill babysitting
-- simpler access through the token gate
 
 Self-hosting this repo gives you:
 
@@ -104,7 +104,7 @@ TELEGRAM_ENABLED=false WEB_ENABLED=true npm start
 
 ## Telegram setup
 
-The bot is the primary product surface. Each Telegram group stores its own chain, token, pools, and alert settings. Write actions require a group admin, an `ADMIN_USER_IDS` entry, or an owner.
+The bot is the primary product surface. Each Telegram group stores its own chain, token, pools, and alert settings. Write actions require a group admin, an `ADMIN_USER_IDS` entry, or an owner. Group admins posting with "Remain Anonymous" are accepted. When a basic group is upgraded to a supergroup, its stored config moves to the new chat id automatically.
 
 For local development and VPS deploys, use `TELEGRAM_MODE=polling`. For hosting platforms with public ingress, use `TELEGRAM_MODE=webhook` with `PUBLIC_BASE_URL` or `TELEGRAM_WEBHOOK_URL` set so the app can register the webhook.
 
@@ -143,6 +143,8 @@ The `/intel` surface and wallet-PnL ledger are included as experimental BYOK fea
 - accuracy depends on RPC completeness, configured pools, and retained DB history
 - local SQLite is acceptable for alpha, but serious use requires backups and monitoring
 - first runs may be slow or incomplete until discovery/backfill catches up
+- on Base, Uniswap v4 pools are only indexed when they use a trusted launchpad hook (built-in allowlist plus `WALLET_PNL_TRUSTED_V4_HOOKS`)
+- `INTEL_ENABLED=false` removes every intel route and stops wallet-PnL and copy-shadow background jobs, leaving only the Telegram bot and landing page
 
 Self-hosted wallet intel is infrastructure-heavy. The hosted baesscan.com intel pages exist because maintaining clean indexed data, RPC coverage, and recovery jobs costs time and provider spend.
 

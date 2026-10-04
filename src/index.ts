@@ -7,6 +7,7 @@ import { getChain } from "./chains/registry";
 import { createStorage } from "./store/store";
 import { TokenService } from "./services/token";
 import { PriceService } from "./services/price";
+import { DexscreenerClient } from "./services/dexscreener";
 import { RpcPool } from "./services/rpcPool";
 import { createAbortableJsonRpcProvider } from "./services/abortableRpcProvider";
 import { registerCommands, installBotCommands } from "./bot/commands";
@@ -66,7 +67,12 @@ async function main(): Promise<void> {
   });
   await store.load();
 
-  const priceService = new PriceService({ ethUsdOverride: env.ethUsdOverride, disableCoinGecko: env.disableCoinGecko, rpcs });
+  const priceService = new PriceService({
+    ethUsdOverride: env.ethUsdOverride,
+    disableCoinGecko: env.disableCoinGecko,
+    rpcs,
+    dexscreener: new DexscreenerClient({ enabled: !env.disableDexscreener })
+  });
   const snapshotStore = R2SnapshotStore.fromEnv(env);
   if ((env.marketSnapshotsEnabled || env.marketArchiveEnabled) && !snapshotStore) {
     logger.warn("market snapshots/archive enabled but R2 credentials are incomplete; public snapshots/archive disabled");
@@ -90,7 +96,7 @@ async function main(): Promise<void> {
     const telegramBot = new Telegraf(env.telegramBotToken);
     bot = telegramBot;
     registerLifecycle(telegramBot, { env, store, logger });
-    registerCommands(telegramBot, { rpc: primaryRpc, rpcs, store, tokenServices, solanaClient, priceService, env, logger });
+    registerCommands(telegramBot, { rpc: primaryRpc, rpcs, store, tokenServices, blockscoutClient, solanaClient, priceService, env, logger });
     tracker = new SwapTracker(rpcs, telegramBot, store, tokenServices, priceService, env, logger, solanaClient);
     tracker.start();
     if (env.telegramMode === "webhook") {
@@ -104,12 +110,12 @@ async function main(): Promise<void> {
   } else {
     logger.warn("telegram disabled; bot polling/webhook and swap tracker are not started");
   }
-  const walletPnl = env.walletPnlEnabled
+  const walletPnl = env.intelEnabled && env.walletPnlEnabled
     ? new WalletPnlIndexer({ env, rpcs: archiveRpcs, store, priceService, blockscoutClient, bot, logger })
     : undefined;
   walletPnl?.start();
-  const copyShadow = new CopyShadowSimulator({ env, store, logger });
-  copyShadow.start();
+  const copyShadow = env.intelEnabled ? new CopyShadowSimulator({ env, store, logger }) : undefined;
+  copyShadow?.start();
   const webServer = env.webEnabled
     ? startWebServer({ env, store, rpcs, solanaClient, priceService, snapshotStore, blockscoutClient, walletPnlIndexer: walletPnl, logger, telegramWebhookPath, telegramWebhook })
     : undefined;
@@ -124,6 +130,7 @@ async function main(): Promise<void> {
       telegramEnabled: env.telegramEnabled,
       telegramMode: env.telegramEnabled ? env.telegramMode : "disabled",
       marketsEnabled: env.marketsEnabled,
+      intelEnabled: env.intelEnabled,
       maxChats: env.maxChats
     },
     "buybot runtime started"

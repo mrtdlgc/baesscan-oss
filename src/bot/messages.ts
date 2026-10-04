@@ -6,6 +6,7 @@ import { chainLabel, getChain } from "../chains/registry";
 import { dexLabel, poolDex, poolVersionLabel } from "../dex/discovery";
 import { escapeHtml, formatCompactNumber, formatFee, formatPrice, formatUsd, trimDecimals, wrapEmojiBar } from "../utils/format";
 import { shortAddress, shortHex } from "../utils/address";
+import { dexscreenerChainSlug } from "../services/dexscreener";
 
 export function welcomeText(env: Env): string {
   const support = env.supportUrl ? `\nSupport: ${env.supportUrl}` : "";
@@ -31,8 +32,8 @@ Admin commands:
 
 /watch [chain] <token> [quote|any] <tokenDeploymentBlock> [dex] [v2|v3|v4|solidly|algebra|curve|balancer] [clanker|flaunch|hooks] [next|all]
   Power-user form: discover pools for a token and start tracking buys.
-  chain can be base, ethereum, bsc, monad, megaeth, arbitrum, optimism, polygon, or avalanche.
-  quote can be native, weth/wbnb, fleth, virtual, usdc, usdt, any, or a token address.
+  chain can be base, ethereum, bsc, monad, megaeth, robinhood, arbitrum, optimism, polygon, or avalanche.
+  quote can be native, weth/wbnb, fleth, virtual, usdc, usdt, usdg, any, or a token address.
   EVM token discovery requires the token deployment block and scans at most 50k blocks.
   Example: /watch arbitrum 0xToken weth 30000000 camelot
 
@@ -382,7 +383,12 @@ export function buildBuyMessage(event: BuyEvent, chat: ChatState): string {
   lines.push(`🪙 Token: <b>${tokenAmount}</b> ${tokenSymbol}`);
   lines.push(`💸 Paid: ${quoteAmount} ${quoteSymbol}${usdSuffix}`);
   if (event.priceUsd !== undefined) lines.push(`💵 Price: ${formatPrice(event.priceUsd)}`);
-  lines.push(`🏦 FDV: ${formatUsd(event.fdvUsd)}`);
+  // Market cap is the more meaningful number when a market data source reports one.
+  lines.push(
+    event.marketCapUsd !== undefined
+      ? `🏦 MC: ${formatUsd(event.marketCapUsd)}`
+      : `🏦 FDV: ${formatUsd(event.fdvUsd)}`
+  );
   if (event.buyerEthBalance !== undefined) lines.push(formatBuyerWalletLine(event.buyerEthBalance, chainConfig.nativeSymbol));
 
   const footer: string[] = [];
@@ -458,23 +464,9 @@ function computeEmojiCount(usd: number | undefined, chat: ChatState): number {
 }
 
 function dexscreenerChartUrl(chain: string, pool: PoolKey): string {
-  const network = DEXSCREENER_CHAIN_SLUGS[chain] ?? chain;
   const pairId = pool.poolAddress ?? pool.id;
-  return `https://dexscreener.com/${encodeURIComponent(network)}/${encodeURIComponent(pairId)}`;
+  return `https://dexscreener.com/${encodeURIComponent(dexscreenerChainSlug(chain))}/${encodeURIComponent(pairId)}`;
 }
-
-const DEXSCREENER_CHAIN_SLUGS: Record<string, string> = {
-  ethereum: "ethereum",
-  bsc: "bsc",
-  base: "base",
-  arbitrum: "arbitrum",
-  optimism: "optimism",
-  monad: "monad",
-  megaeth: "megaeth",
-  polygon: "polygon",
-  avalanche: "avalanche",
-  solana: "solana"
-};
 
 function shortToken(value: string): string {
   return value.startsWith("0x") ? shortAddress(value) : shortHex(value, 6, 6);

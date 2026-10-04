@@ -7,11 +7,13 @@ interface PageOptions {
 }
 
 const DEFAULT_META_DESCRIPTION = "baes scan is a Telegram-first buybot for pool-aware DEX buy alerts, holder intel, and route-specific token launch monitoring.";
+const BUYBOT_ONLY_META_DESCRIPTION = "baes scan is a Telegram-first buybot for pool-aware DEX buy alerts and route-specific token launch monitoring.";
 const DEFAULT_OG_IMAGE = "/og/baes-scan.png";
 const BLOCKSCOUT_URL = "https://www.blockscout.com/";
+export const OSS_REPO_URL = "https://github.com/mrtdlgc/baesscan-oss";
 
 export function page(title: string, body: string, options: PageOptions = {}): string {
-  const description = options.description ?? DEFAULT_META_DESCRIPTION;
+  const description = options.description ?? (intelEnabledFromEnv() ? DEFAULT_META_DESCRIPTION : BUYBOT_ONLY_META_DESCRIPTION);
   const canonical = options.canonicalPath ? absoluteUrl(options.canonicalPath) : undefined;
   const image = absoluteUrl(options.imagePath ?? DEFAULT_OG_IMAGE);
   const ogType = options.ogType ?? "website";
@@ -64,9 +66,18 @@ function blockscoutFooter(): string {
 <footer class="site-footer" aria-label="Site credits">
   <div>
     <span>baes scan</span>
-    ${blockscoutPoweredLink("site-footer-blockscout")}
+    <nav class="site-footer-links" aria-label="Project links">
+      <a class="site-footer-github" href="${OSS_REPO_URL}" target="_blank" rel="noreferrer">GitHub</a>
+      ${blockscoutPoweredLink("site-footer-blockscout")}
+    </nav>
   </div>
 </footer>`;
+}
+
+function intelEnabledFromEnv(): boolean {
+  const raw = process.env.INTEL_ENABLED;
+  if (raw === undefined || raw.trim() === "") return true;
+  return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
 }
 
 function absoluteUrl(pathOrUrl: string): string {

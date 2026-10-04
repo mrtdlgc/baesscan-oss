@@ -5,7 +5,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import type { AppState, BannedChat, ChainSlug, ChatSettings, ChatState, PoolKey } from "../types";
 import { WALLET_PNL_IGNORED_TOKEN_SYMBOLS, walletPnlIgnoredTokenAddresses } from "../services/walletPnlFilters";
-import { poolV4Hook, trustedV4Hook, untrustedV4Hook, untrustedV4HookRiskScore } from "../services/v4HookRisk";
+import { poolV4Hook, trustedV4Hook, trustedV4HookSet, untrustedV4Hook, untrustedV4HookRiskScore } from "../services/v4HookRisk";
 import { buildWalletPnlGoodSignalWallets } from "../services/walletPnlGoodSignal";
 import type {
   ChatLastBlockUpdate,
@@ -28,12 +28,15 @@ import type {
   WalletPnlProfileStage,
   WalletPnlCursor,
   WalletPnlPoolRecord,
+  WalletPnlPoolScanOptions,
   WalletPnlSnapshot,
   WalletPnlTokenCreatorRecord,
+  WalletPnlTradeReadOptions,
   WalletPnlWalletSummary,
   WalletPnlTradeRecord
 } from "./storage";
 import { mergeWalletPnlClusterRecord } from "./storage";
+import { walletPnlScanSources } from "./walletPnlPoolScan";
 import { defaultSettings } from "./jsonStore";
 import { cloneChat } from "./snapshots";
 
@@ -47,6 +50,7 @@ const SQLITE_MMAP_SIZE_BYTES = 1_073_741_824;
 const SQLITE_WAL_AUTOCHECKPOINT_PAGES = 1_000;
 const WALLET_PNL_ANALYTICS_WORKER_FILE = "walletPnlAnalyticsWorker.js";
 const WALLET_PNL_ANALYTICS_WORKER_TIMEOUT_MS = 10 * 60_000;
+const WALLET_PNL_HOOK_POLICY_VERSION = 1;
 
 interface ChatRow {
   chat_id: number;
@@ -207,6 +211,7 @@ type WalletPnlSnapshotBuildOptions = {
   snapshotLimit: number;
   minProfitUsd: number;
   partial: boolean;
+  trustedV4Hooks?: string[];
   profile?: WalletPnlProfileSink;
 };
 
@@ -375,6 +380,7 @@ export class SqliteStateStore implements Storage {
         PRIMARY KEY (chain, pool_id)
       );
       CREATE INDEX IF NOT EXISTS wallet_pnl_pools_chain_seen_idx ON wallet_pnl_pools(chain, first_seen_block);
+      CREATE INDEX IF NOT EXISTS wallet_pnl_pools_chain_source_idx ON wallet_pnl_pools(chain, source);
       CREATE TABLE IF NOT EXISTS wallet_pnl_token_creators (
         chain TEXT NOT NULL,
         token_address TEXT NOT NULL,
@@ -1041,6 +1047,67 @@ export class SqliteStateStore implements Storage {
     return rows.map((row) => this.walletPnlPoolFromRow(row)).filter((record): record is WalletPnlPoolRecord => Boolean(record));
   }
 
+  getWalletPnlScanPools(chain: ChainSlug, options?: WalletPnlPoolScanOptions): WalletPnlPoolRecord[] {
+    const sources = [...walletPnlScanSources(options?.sources)];
+    if (sources.length === 0) return [];
+    const sourcePlaceholders = sources.map(() => "?").join(", ");
+    const trustedHooks = trustedV4HookSet(options?.trustedV4Hooks);
+    const trustedHookValues = [...trustedHooks].filter((hook) => hook !== "0x0000000000000000000000000000000000000000");
+    const trustedHookPredicate = trustedHookValues.length > 0
+      ? ` OR LOWER(COALESCE(json_extract(p.data_json, '$.hooks'), '')) IN (${trustedHookValues.map(() => "?").join(", ")})`
+      : "";
+    const baseTrustedHookPredicate = trustedHookValues.length > 0
+      ? `LOWER(COALESCE(json_extract(p.data_json, '$.hooks'), '')) IN (${trustedHookValues.map(() => "?").join(", ")})`
+      : "0";
+    const lastTradeWhere = options?.activeFromBlock !== undefined ? "chain = ? AND block_number >= ?" : "chain = ?";
+    const sql = `
+      WITH last_trade AS (
+        SELECT pool_id, MAX(block_number) AS last_trade_block
+        FROM wallet_pnl_trades
+        WHERE ${lastTradeWhere}
+        GROUP BY pool_id
+      )
+      SELECT p.*
+      FROM wallet_pnl_pools p
+      LEFT JOIN last_trade t ON t.pool_id = p.pool_id
+      WHERE p.chain = ?
+        AND p.source IN (${sourcePlaceholders})
+        AND (
+          p.chain != 'base'
+          OR LOWER(COALESCE(json_extract(p.data_json, '$.dex'), 'uniswap')) != 'uniswap'
+          OR LOWER(COALESCE(json_extract(p.data_json, '$.protocol'), 'v4')) != 'v4'
+          OR ${baseTrustedHookPredicate}
+        )
+        AND (
+          p.source = 'seed'
+          OR t.last_trade_block IS NOT NULL
+          OR p.source = 'blockscout'
+          OR NOT (
+            p.source = 'factory'
+            AND LOWER(COALESCE(json_extract(p.data_json, '$.dex'), 'uniswap')) = 'uniswap'
+            AND LOWER(COALESCE(json_extract(p.data_json, '$.protocol'), 'v4')) = 'v4'
+          )
+          ${trustedHookPredicate}
+        )
+      ORDER BY
+        CASE
+          WHEN p.source = 'seed' THEN 0
+          WHEN t.last_trade_block IS NOT NULL THEN 1
+          WHEN p.source = 'blockscout' THEN 2
+          ELSE 3
+        END,
+        COALESCE(t.last_trade_block, p.last_seen_block, p.first_seen_block, 0) DESC,
+        p.pool_id
+      ${options?.limit && options.limit > 0 ? "LIMIT ?" : ""}
+    `;
+    const params: SQLInputValue[] = options?.activeFromBlock !== undefined
+      ? [chain, options.activeFromBlock, chain, ...sources, ...trustedHookValues, ...trustedHookValues]
+      : [chain, chain, ...sources, ...trustedHookValues, ...trustedHookValues];
+    if (options?.limit && options.limit > 0) params.push(options.limit);
+    const rows = this.db.prepare(sql).all(...params) as unknown as WalletPnlPoolRow[];
+    return rows.map((row) => this.walletPnlPoolFromRow(row)).filter((record): record is WalletPnlPoolRecord => Boolean(record));
+  }
+
   getWalletPnlPool(chain: ChainSlug, poolId: string): WalletPnlPoolRecord | undefined {
     const row = this.db.prepare("SELECT * FROM wallet_pnl_pools WHERE chain = ? AND pool_id = ?").get(chain, poolId.toLowerCase()) as WalletPnlPoolRow | undefined;
     return row ? this.walletPnlPoolFromRow(row) : undefined;
@@ -1163,38 +1230,37 @@ export class SqliteStateStore implements Storage {
     return Number(result.changes ?? 0);
   }
 
-  getWalletPnlTrades(chain: ChainSlug, fromBlock?: number): WalletPnlTradeRecord[] {
-    const sql = `SELECT data_json FROM wallet_pnl_trades WHERE chain = ?${fromBlock !== undefined ? " AND block_number >= ?" : ""} ORDER BY block_number, log_index`;
-    const rows = (fromBlock !== undefined
-      ? this.db.prepare(sql).all(chain, fromBlock)
-      : this.db.prepare(sql).all(chain)) as unknown as WalletPnlTradeRow[];
+  getWalletPnlTrades(chain: ChainSlug, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[] {
+    const where = this.walletPnlReadTradeWhere(chain, fromBlock, options?.trustedV4Hooks);
+    const sql = `SELECT data_json FROM wallet_pnl_trades WHERE ${where.sql} ORDER BY block_number, log_index`;
+    const rows = this.db.prepare(sql).all(...where.args) as unknown as WalletPnlTradeRow[];
     return this.walletPnlTradesFromRows(rows);
   }
 
-  getWalletPnlTradesForToken(chain: ChainSlug, tokenAddress: string, fromBlock?: number): WalletPnlTradeRecord[] {
-    const sql = `SELECT data_json FROM wallet_pnl_trades WHERE chain = ? AND token_address = ?${fromBlock !== undefined ? " AND block_number >= ?" : ""} ORDER BY block_number, log_index`;
+  getWalletPnlTradesForToken(chain: ChainSlug, tokenAddress: string, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[] {
+    const where = this.walletPnlReadTradeWhere(chain, fromBlock, options?.trustedV4Hooks);
     const normalized = tokenAddress.toLowerCase();
-    const rows = (fromBlock !== undefined
-      ? this.db.prepare(sql).all(chain, normalized, fromBlock)
-      : this.db.prepare(sql).all(chain, normalized)) as unknown as WalletPnlTradeRow[];
+    const rows = this.db.prepare(
+      `SELECT data_json FROM wallet_pnl_trades WHERE ${where.sql} AND token_address = ? ORDER BY block_number, log_index`
+    ).all(...where.args, normalized) as unknown as WalletPnlTradeRow[];
     return this.walletPnlTradesFromRows(rows);
   }
 
-  getWalletPnlTradesForWallet(chain: ChainSlug, wallet: string, fromBlock?: number): WalletPnlTradeRecord[] {
-    const sql = `SELECT data_json FROM wallet_pnl_trades WHERE chain = ? AND wallet = ?${fromBlock !== undefined ? " AND block_number >= ?" : ""} ORDER BY block_number, log_index`;
+  getWalletPnlTradesForWallet(chain: ChainSlug, wallet: string, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[] {
+    const where = this.walletPnlReadTradeWhere(chain, fromBlock, options?.trustedV4Hooks);
     const normalized = wallet.toLowerCase();
-    const rows = (fromBlock !== undefined
-      ? this.db.prepare(sql).all(chain, normalized, fromBlock)
-      : this.db.prepare(sql).all(chain, normalized)) as unknown as WalletPnlTradeRow[];
+    const rows = this.db.prepare(
+      `SELECT data_json FROM wallet_pnl_trades WHERE ${where.sql} AND wallet = ? ORDER BY block_number, log_index`
+    ).all(...where.args, normalized) as unknown as WalletPnlTradeRow[];
     return this.walletPnlTradesFromRows(rows);
   }
 
-  getWalletPnlTradesForPool(chain: ChainSlug, poolId: string, fromBlock?: number): WalletPnlTradeRecord[] {
-    const sql = `SELECT data_json FROM wallet_pnl_trades WHERE chain = ? AND pool_id = ?${fromBlock !== undefined ? " AND block_number >= ?" : ""} ORDER BY block_number, log_index`;
+  getWalletPnlTradesForPool(chain: ChainSlug, poolId: string, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[] {
+    const where = this.walletPnlReadTradeWhere(chain, fromBlock, options?.trustedV4Hooks);
     const normalized = poolId.toLowerCase();
-    const rows = (fromBlock !== undefined
-      ? this.db.prepare(sql).all(chain, normalized, fromBlock)
-      : this.db.prepare(sql).all(chain, normalized)) as unknown as WalletPnlTradeRow[];
+    const rows = this.db.prepare(
+      `SELECT data_json FROM wallet_pnl_trades WHERE ${where.sql} AND pool_id = ? ORDER BY block_number, log_index`
+    ).all(...where.args, normalized) as unknown as WalletPnlTradeRow[];
     return this.walletPnlTradesFromRows(rows);
   }
 
@@ -1210,7 +1276,7 @@ export class SqliteStateStore implements Storage {
     const retentionFromBlock = Math.max(0, options.toBlock - options.retentionBlocks + 1);
     const positionFromBlock = Math.max(retentionFromBlock, options.toBlock - options.positionBlocks + 1);
     const rangeReady = walletPnlProfileStage(options.profile, "snapshot.rangeReady", () =>
-      this.walletPnlFlatRangeReady(options.chain, positionFromBlock, options.toBlock)
+      this.walletPnlFlatRangeReady(options.chain, positionFromBlock, options.toBlock, options.trustedV4Hooks)
     );
     if (!rangeReady) return undefined;
     const positions = new Map<string, WalletPnlFlatPnlState>();
@@ -1218,7 +1284,7 @@ export class SqliteStateStore implements Storage {
 
     let scannedRows = 0;
     const fifoStartedAt = Date.now();
-    for (const row of this.iterateWalletPnlFlatRows(options.chain, positionFromBlock, options.toBlock, true)) {
+    for (const row of this.iterateWalletPnlFlatRows(options.chain, positionFromBlock, options.toBlock, true, options.trustedV4Hooks)) {
       scannedRows += 1;
       const valueUsd = walletPnlFinite(row.volume_usd);
       const baseAmount = walletPnlFinite(row.base_amount);
@@ -1294,6 +1360,7 @@ export class SqliteStateStore implements Storage {
 
     return {
       schemaVersion: 1,
+      hookPolicyVersion: WALLET_PNL_HOOK_POLICY_VERSION,
       chain: options.chain,
       generatedAt: new Date().toISOString(),
       windowHours: options.windowHours,
@@ -1304,7 +1371,7 @@ export class SqliteStateStore implements Storage {
       retentionFromBlock,
       toBlock: options.toBlock,
       tradeCount: walletPnlProfileStage(options.profile, "snapshot.tradeCount", () =>
-        this.countWalletPnlFlatTrades(options.chain, windowFromBlock, options.toBlock, false)
+        this.countWalletPnlFlatTrades(options.chain, windowFromBlock, options.toBlock, false, options.trustedV4Hooks)
       ),
       walletCount: summaries.size,
       top,
@@ -1321,7 +1388,7 @@ export class SqliteStateStore implements Storage {
 
   buildWalletPnlAnalyticsSnapshotFromFlatTrades(options: WalletPnlAnalyticsBuildOptions): WalletPnlAnalyticsSnapshot | undefined {
     const rangeReady = walletPnlProfileStage(options.profile, "analytics.rangeReady", () =>
-      this.walletPnlFlatRangeReady(options.chain, options.positionFromBlock, options.toBlock)
+      this.walletPnlFlatRangeReady(options.chain, options.positionFromBlock, options.toBlock, options.trustedV4Hooks)
     );
     if (!rangeReady) return undefined;
     const tokenSummaries = walletPnlProfileStage(options.profile, "analytics.token.total", () =>
@@ -1329,7 +1396,7 @@ export class SqliteStateStore implements Storage {
       (rows) => rows.length
     );
     const walletSummaries = walletPnlProfileStage(options.profile, "analytics.wallet.total", () =>
-      this.walletPnlWalletAnalyticsFromSql(options.chain, options.fromBlock, options.toBlock, options.profile),
+      this.walletPnlWalletAnalyticsFromSql(options.chain, options.fromBlock, options.toBlock, options.trustedV4Hooks, options.profile),
       (rows) => rows.length
     );
     const poolSummaries = walletPnlProfileStage(options.profile, "analytics.pool.total", () =>
@@ -1343,6 +1410,7 @@ export class SqliteStateStore implements Storage {
         options.positionFromBlock,
         options.toBlock,
         options.fromBlock,
+        options.trustedV4Hooks,
         trustedV4HookPoolIds,
         options.profile
       ),
@@ -1368,6 +1436,7 @@ export class SqliteStateStore implements Storage {
 
     return {
       schemaVersion: 1,
+      hookPolicyVersion: WALLET_PNL_HOOK_POLICY_VERSION,
       chain: options.chain,
       generatedAt: new Date().toISOString(),
       windowHours: options.windowHours,
@@ -1376,7 +1445,7 @@ export class SqliteStateStore implements Storage {
       fromBlock: options.fromBlock,
       toBlock: options.toBlock,
       tradeCount: walletPnlProfileStage(options.profile, "analytics.tradeCount", () =>
-        this.countWalletPnlFlatTrades(options.chain, options.fromBlock, options.toBlock, false)
+        this.countWalletPnlFlatTrades(options.chain, options.fromBlock, options.toBlock, false, options.trustedV4Hooks)
       ),
       tokenCount: tokenSummaries.length,
       walletCount: walletSummaries.length,
@@ -1419,6 +1488,7 @@ export class SqliteStateStore implements Storage {
     if (!tokens) return undefined;
     return {
       schemaVersion: 1,
+      hookPolicyVersion: WALLET_PNL_HOOK_POLICY_VERSION,
       chain: options.chain,
       generatedAt: new Date().toISOString(),
       windowHours: options.windowHours,
@@ -1436,9 +1506,9 @@ export class SqliteStateStore implements Storage {
     trustedV4Hooks?: string[];
     limit: number;
   }): WalletPnlAnalyticsTokenSummary[] | undefined {
-    if (!this.walletPnlFlatRangeReady(options.chain, options.fromBlock, options.toBlock)) return undefined;
+    if (!this.walletPnlFlatRangeReady(options.chain, options.fromBlock, options.toBlock, options.trustedV4Hooks)) return undefined;
     const limit = Math.max(1, Math.floor(options.limit));
-    const where = this.walletPnlRangeWhere(options.chain, options.fromBlock, options.toBlock, true);
+    const where = this.walletPnlRangeWhere(options.chain, options.fromBlock, options.toBlock, true, options.trustedV4Hooks);
     const rows = this.db.prepare(`
       SELECT
         token_address,
@@ -1601,7 +1671,7 @@ export class SqliteStateStore implements Storage {
     trustedV4Hooks?: string[],
     profile?: WalletPnlProfileSink
   ): WalletPnlAnalyticsTokenSummary[] {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true);
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.token.summarySql", () => this.db.prepare(`
       SELECT
         token_address,
@@ -1623,9 +1693,9 @@ export class SqliteStateStore implements Storage {
       WHERE ${where.sql}
       GROUP BY token_address
     `).all(...where.args) as unknown as Array<Record<string, unknown>>, (rows) => rows.length);
-    const latestPrice = this.walletPnlLatestPriceByToken(chain, fromBlock, toBlock, profile);
-    const topWalletVolume = this.walletPnlTopWalletVolumeByToken(chain, fromBlock, toBlock, profile);
-    const dexProtocols = this.walletPnlDexProtocolsByToken(chain, fromBlock, toBlock, profile);
+    const latestPrice = this.walletPnlLatestPriceByToken(chain, fromBlock, toBlock, trustedV4Hooks, profile);
+    const topWalletVolume = this.walletPnlTopWalletVolumeByToken(chain, fromBlock, toBlock, trustedV4Hooks, profile);
+    const dexProtocols = this.walletPnlDexProtocolsByToken(chain, fromBlock, toBlock, trustedV4Hooks, profile);
     const hookRisk = this.walletPnlV4HookRiskByToken(chain, fromBlock, toBlock, trustedV4Hooks, profile);
     return rows
       .map((row): WalletPnlAnalyticsTokenSummary => {
@@ -1690,8 +1760,14 @@ export class SqliteStateStore implements Storage {
       .sort((a, b) => b.volumeUsd - a.volumeUsd || b.tradeCount - a.tradeCount);
   }
 
-  private walletPnlWalletAnalyticsFromSql(chain: ChainSlug, fromBlock: number, toBlock: number, profile?: WalletPnlProfileSink): WalletPnlAnalyticsWalletSummary[] {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, false);
+  private walletPnlWalletAnalyticsFromSql(
+    chain: ChainSlug,
+    fromBlock: number,
+    toBlock: number,
+    trustedV4Hooks?: string[],
+    profile?: WalletPnlProfileSink
+  ): WalletPnlAnalyticsWalletSummary[] {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, false, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.wallet.summarySql", () => this.db.prepare(`
       SELECT
         wallet,
@@ -1707,9 +1783,9 @@ export class SqliteStateStore implements Storage {
       WHERE ${where.sql}
       GROUP BY wallet
     `).all(...where.args) as unknown as Array<Record<string, unknown>>, (rows) => rows.length);
-    const tokenCounts = this.walletPnlTokenCountByWallet(chain, fromBlock, toBlock, profile);
-    const topTokens = this.walletPnlTopTokenByWallet(chain, fromBlock, toBlock, profile);
-    const topPools = this.walletPnlTopPoolByWallet(chain, fromBlock, toBlock, profile);
+    const tokenCounts = this.walletPnlTokenCountByWallet(chain, fromBlock, toBlock, trustedV4Hooks, profile);
+    const topTokens = this.walletPnlTopTokenByWallet(chain, fromBlock, toBlock, trustedV4Hooks, profile);
+    const topPools = this.walletPnlTopPoolByWallet(chain, fromBlock, toBlock, trustedV4Hooks, profile);
     return rows.map((row): WalletPnlAnalyticsWalletSummary => {
       const wallet = String(row.wallet).toLowerCase();
       const tradeCount = walletPnlInt(row.trade_count);
@@ -1765,7 +1841,7 @@ export class SqliteStateStore implements Storage {
     trustedV4Hooks?: string[],
     profile?: WalletPnlProfileSink
   ): WalletPnlAnalyticsPoolSummary[] {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true);
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.pool.summarySql", () => this.db.prepare(`
       SELECT
         pool_id,
@@ -1788,7 +1864,7 @@ export class SqliteStateStore implements Storage {
       WHERE ${where.sql}
       GROUP BY pool_id
     `).all(...where.args) as unknown as Array<Record<string, unknown>>, (rows) => rows.length);
-    const topWalletVolume = this.walletPnlTopWalletVolumeByPool(chain, fromBlock, toBlock, profile);
+    const topWalletVolume = this.walletPnlTopWalletVolumeByPool(chain, fromBlock, toBlock, trustedV4Hooks, profile);
     const hookRisk = this.walletPnlV4HookRiskByPool(chain, fromBlock, toBlock, trustedV4Hooks, profile);
     return rows
       .map((row): WalletPnlAnalyticsPoolSummary => {
@@ -1847,6 +1923,7 @@ export class SqliteStateStore implements Storage {
     positionFromBlock: number,
     toBlock: number,
     summaryFromBlock = positionFromBlock,
+    trustedV4Hooks?: string[],
     trustedV4HookPoolIds?: ReadonlySet<string>,
     profile?: WalletPnlProfileSink
   ): WalletPnlAnalyticsPnlLeader[] {
@@ -1854,7 +1931,7 @@ export class SqliteStateStore implements Storage {
     const summaries = new Map<string, WalletPnlFlatLeaderSummary>();
     let scannedRows = 0;
     const fifoStartedAt = Date.now();
-    for (const row of this.iterateWalletPnlFlatRows(chain, positionFromBlock, toBlock, true)) {
+    for (const row of this.iterateWalletPnlFlatRows(chain, positionFromBlock, toBlock, true, trustedV4Hooks)) {
       scannedRows += 1;
       const valueUsd = walletPnlFinite(row.volume_usd);
       const baseAmount = walletPnlFinite(row.base_amount);
@@ -1924,8 +2001,14 @@ export class SqliteStateStore implements Storage {
       }));
   }
 
-  private iterateWalletPnlFlatRows(chain: ChainSlug, fromBlock: number, toBlock: number, excludeIgnored: boolean): Iterable<WalletPnlFlatTradeRow> {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, excludeIgnored);
+  private iterateWalletPnlFlatRows(
+    chain: ChainSlug,
+    fromBlock: number,
+    toBlock: number,
+    excludeIgnored: boolean,
+    trustedV4Hooks?: string[]
+  ): Iterable<WalletPnlFlatTradeRow> {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, excludeIgnored, trustedV4Hooks);
     return this.db.prepare(`
       SELECT
         chain, tx_hash, log_index, pool_id, pool_address, wallet, token_address, token_symbol,
@@ -1937,26 +2020,28 @@ export class SqliteStateStore implements Storage {
     `).iterate(...where.args) as Iterable<WalletPnlFlatTradeRow>;
   }
 
-  private countWalletPnlFlatTrades(chain: ChainSlug, fromBlock: number, toBlock: number, excludeIgnored: boolean): number {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, excludeIgnored);
+  private countWalletPnlFlatTrades(chain: ChainSlug, fromBlock: number, toBlock: number, excludeIgnored: boolean, trustedV4Hooks?: string[]): number {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, excludeIgnored, trustedV4Hooks);
     const row = this.db.prepare(`SELECT COUNT(*) AS count FROM wallet_pnl_trades WHERE ${where.sql}`).get(...where.args) as { count: number } | undefined;
     return walletPnlInt(row?.count);
   }
 
-  private walletPnlFlatRangeReady(chain: ChainSlug, fromBlock: number, toBlock: number): boolean {
+  private walletPnlFlatRangeReady(chain: ChainSlug, fromBlock: number, toBlock: number, trustedV4Hooks?: string[]): boolean {
+    const eligible = this.walletPnlEligibleTradeWhere("", chain, trustedV4Hooks);
     const row = this.db.prepare(
       `SELECT 1 FROM wallet_pnl_trades
        WHERE chain = ?
          AND block_number >= ?
          AND block_number <= ?
+         AND ${eligible.sql}
          AND (token_symbol IS NULL OR quote_address IS NULL OR base_amount IS NULL OR dex IS NULL OR protocol IS NULL)
        LIMIT 1`
-    ).get(chain, fromBlock, toBlock) as unknown;
+    ).get(chain, fromBlock, toBlock, ...eligible.args) as unknown;
     return row === undefined;
   }
 
-  private walletPnlLatestPriceByToken(chain: ChainSlug, fromBlock: number, toBlock: number, profile?: WalletPnlProfileSink): Map<string, number> {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true);
+  private walletPnlLatestPriceByToken(chain: ChainSlug, fromBlock: number, toBlock: number, trustedV4Hooks?: string[], profile?: WalletPnlProfileSink): Map<string, number> {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.token.latestPriceSql", () => this.db.prepare(`
       SELECT token_address, price_usd
       FROM (
@@ -1970,8 +2055,8 @@ export class SqliteStateStore implements Storage {
     return new Map(rows.map((row) => [row.token_address.toLowerCase(), walletPnlNumber(row.price_usd)]));
   }
 
-  private walletPnlTopWalletVolumeByToken(chain: ChainSlug, fromBlock: number, toBlock: number, profile?: WalletPnlProfileSink): Map<string, number> {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true);
+  private walletPnlTopWalletVolumeByToken(chain: ChainSlug, fromBlock: number, toBlock: number, trustedV4Hooks?: string[], profile?: WalletPnlProfileSink): Map<string, number> {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.token.topWalletSql", () => this.db.prepare(`
       SELECT token_address, MAX(wallet_volume_usd) AS top_wallet_volume_usd
       FROM (
@@ -1985,8 +2070,8 @@ export class SqliteStateStore implements Storage {
     return new Map(rows.map((row) => [row.token_address.toLowerCase(), walletPnlNumber(row.top_wallet_volume_usd)]));
   }
 
-  private walletPnlTopWalletVolumeByPool(chain: ChainSlug, fromBlock: number, toBlock: number, profile?: WalletPnlProfileSink): Map<string, number> {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true);
+  private walletPnlTopWalletVolumeByPool(chain: ChainSlug, fromBlock: number, toBlock: number, trustedV4Hooks?: string[], profile?: WalletPnlProfileSink): Map<string, number> {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.pool.topWalletSql", () => this.db.prepare(`
       SELECT pool_id, MAX(wallet_volume_usd) AS top_wallet_volume_usd
       FROM (
@@ -2000,8 +2085,8 @@ export class SqliteStateStore implements Storage {
     return new Map(rows.map((row) => [row.pool_id.toLowerCase(), walletPnlNumber(row.top_wallet_volume_usd)]));
   }
 
-  private walletPnlDexProtocolsByToken(chain: ChainSlug, fromBlock: number, toBlock: number, profile?: WalletPnlProfileSink): Map<string, { dexes: string[]; protocols: string[] }> {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true);
+  private walletPnlDexProtocolsByToken(chain: ChainSlug, fromBlock: number, toBlock: number, trustedV4Hooks?: string[], profile?: WalletPnlProfileSink): Map<string, { dexes: string[]; protocols: string[] }> {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.token.dexProtocolsSql", () => this.db.prepare(`
       SELECT token_address, GROUP_CONCAT(DISTINCT dex) AS dexes, GROUP_CONCAT(DISTINCT protocol) AS protocols
       FROM wallet_pnl_trades
@@ -2024,7 +2109,7 @@ export class SqliteStateStore implements Storage {
     trustedV4Hooks?: string[],
     profile?: WalletPnlProfileSink
   ): Map<string, { untrustedV4HookCount: number; untrustedV4Hooks: string[] }> {
-    const where = this.walletPnlAliasedRangeWhere("t", chain, fromBlock, toBlock, true);
+    const where = this.walletPnlAliasedRangeWhere("t", chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.token.v4HookRiskSql", () => this.db.prepare(`
       SELECT DISTINCT t.token_address, t.pool_id, p.data_json
       FROM wallet_pnl_trades t
@@ -2056,7 +2141,7 @@ export class SqliteStateStore implements Storage {
     trustedV4Hooks?: string[],
     profile?: WalletPnlProfileSink
   ): Map<string, { v4Hook?: string; untrustedV4Hook: boolean }> {
-    const where = this.walletPnlAliasedRangeWhere("t", chain, fromBlock, toBlock, true);
+    const where = this.walletPnlAliasedRangeWhere("t", chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.pool.v4HookRiskSql", () => this.db.prepare(`
       SELECT DISTINCT t.pool_id, p.data_json
       FROM wallet_pnl_trades t
@@ -2094,8 +2179,8 @@ export class SqliteStateStore implements Storage {
     return out;
   }
 
-  private walletPnlTokenCountByWallet(chain: ChainSlug, fromBlock: number, toBlock: number, profile?: WalletPnlProfileSink): Map<string, number> {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true);
+  private walletPnlTokenCountByWallet(chain: ChainSlug, fromBlock: number, toBlock: number, trustedV4Hooks?: string[], profile?: WalletPnlProfileSink): Map<string, number> {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.wallet.tokenCountSql", () => this.db.prepare(`
       SELECT wallet, COUNT(DISTINCT token_address) AS token_count
       FROM wallet_pnl_trades
@@ -2105,8 +2190,8 @@ export class SqliteStateStore implements Storage {
     return new Map(rows.map((row) => [row.wallet.toLowerCase(), walletPnlInt(row.token_count)]));
   }
 
-  private walletPnlTopTokenByWallet(chain: ChainSlug, fromBlock: number, toBlock: number, profile?: WalletPnlProfileSink): Map<string, { tokenAddress: string; tokenSymbol: string; volumeUsd: number }> {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true);
+  private walletPnlTopTokenByWallet(chain: ChainSlug, fromBlock: number, toBlock: number, trustedV4Hooks?: string[], profile?: WalletPnlProfileSink): Map<string, { tokenAddress: string; tokenSymbol: string; volumeUsd: number }> {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, true, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.wallet.topTokenSql", () => this.db.prepare(`
       SELECT wallet, token_address, token_symbol, token_volume_usd
       FROM (
@@ -2126,8 +2211,8 @@ export class SqliteStateStore implements Storage {
     }]));
   }
 
-  private walletPnlTopPoolByWallet(chain: ChainSlug, fromBlock: number, toBlock: number, profile?: WalletPnlProfileSink): Map<string, { poolId: string; volumeUsd: number }> {
-    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, false);
+  private walletPnlTopPoolByWallet(chain: ChainSlug, fromBlock: number, toBlock: number, trustedV4Hooks?: string[], profile?: WalletPnlProfileSink): Map<string, { poolId: string; volumeUsd: number }> {
+    const where = this.walletPnlRangeWhere(chain, fromBlock, toBlock, false, trustedV4Hooks);
     const rows = walletPnlProfileStage(profile, "analytics.wallet.topPoolSql", () => this.db.prepare(`
       SELECT wallet, pool_id, pool_volume_usd
       FROM (
@@ -2145,9 +2230,31 @@ export class SqliteStateStore implements Storage {
     }]));
   }
 
-  private walletPnlRangeWhere(chain: ChainSlug, fromBlock: number, toBlock: number, excludeIgnored: boolean): { sql: string; args: SQLInputValue[] } {
+  private walletPnlReadTradeWhere(chain: ChainSlug, fromBlock?: number, trustedV4Hooks?: readonly string[]): { sql: string; args: SQLInputValue[] } {
+    const conditions = ["chain = ?"];
+    const args: SQLInputValue[] = [chain];
+    if (fromBlock !== undefined) {
+      conditions.push("block_number >= ?");
+      args.push(fromBlock);
+    }
+    const eligible = this.walletPnlEligibleTradeWhere("", chain, trustedV4Hooks);
+    conditions.push(eligible.sql);
+    args.push(...eligible.args);
+    return { sql: conditions.join(" AND "), args };
+  }
+
+  private walletPnlRangeWhere(
+    chain: ChainSlug,
+    fromBlock: number,
+    toBlock: number,
+    excludeIgnored: boolean,
+    trustedV4Hooks?: readonly string[]
+  ): { sql: string; args: SQLInputValue[] } {
     const conditions = ["chain = ?", "block_number >= ?", "block_number <= ?"];
     const args: SQLInputValue[] = [chain, fromBlock, toBlock];
+    const eligible = this.walletPnlEligibleTradeWhere("", chain, trustedV4Hooks);
+    conditions.push(eligible.sql);
+    args.push(...eligible.args);
     if (excludeIgnored) {
       const ignored = this.walletPnlIgnoredTokenWhere();
       conditions.push(ignored.sql);
@@ -2161,10 +2268,20 @@ export class SqliteStateStore implements Storage {
     return { sql: conditions.join(" AND "), args };
   }
 
-  private walletPnlAliasedRangeWhere(alias: string, chain: ChainSlug, fromBlock: number, toBlock: number, excludeIgnored: boolean): { sql: string; args: SQLInputValue[] } {
+  private walletPnlAliasedRangeWhere(
+    alias: string,
+    chain: ChainSlug,
+    fromBlock: number,
+    toBlock: number,
+    excludeIgnored: boolean,
+    trustedV4Hooks?: readonly string[]
+  ): { sql: string; args: SQLInputValue[] } {
     const prefix = alias ? `${alias}.` : "";
     const conditions = [`${prefix}chain = ?`, `${prefix}block_number >= ?`, `${prefix}block_number <= ?`];
     const args: SQLInputValue[] = [chain, fromBlock, toBlock];
+    const eligible = this.walletPnlEligibleTradeWhere(prefix, chain, trustedV4Hooks);
+    conditions.push(eligible.sql);
+    args.push(...eligible.args);
     if (excludeIgnored) {
       conditions.push(`UPPER(COALESCE(${prefix}token_symbol, '')) NOT IN (${WALLET_PNL_IGNORED_SYMBOLS.map(() => "?").join(", ")})`);
       args.push(...WALLET_PNL_IGNORED_SYMBOLS);
@@ -2175,6 +2292,29 @@ export class SqliteStateStore implements Storage {
       }
     }
     return { sql: conditions.join(" AND "), args };
+  }
+
+  private walletPnlEligibleTradeWhere(prefix: string, chain: ChainSlug, trustedV4Hooks?: readonly string[]): { sql: string; args: SQLInputValue[] } {
+    if (chain !== "base") return { sql: "1 = 1", args: [] };
+    const trustedHookValues = [...trustedV4HookSet(trustedV4Hooks)]
+      .filter((hook) => hook !== "0x0000000000000000000000000000000000000000");
+    const trustedHookPredicate = trustedHookValues.length > 0
+      ? `LOWER(COALESCE(json_extract(p.data_json, '$.hooks'), '')) IN (${trustedHookValues.map(() => "?").join(", ")})`
+      : "0";
+    return {
+      sql: `(
+        ${prefix}chain != 'base'
+        OR LOWER(COALESCE(${prefix}dex, '')) != 'uniswap'
+        OR LOWER(COALESCE(${prefix}protocol, '')) != 'v4'
+        OR LOWER(COALESCE(${prefix}pool_id, '')) IN (
+          SELECT LOWER(p.pool_id)
+          FROM wallet_pnl_pools p
+          WHERE p.chain = ?
+            AND ${trustedHookPredicate}
+        )
+      )`,
+      args: [chain, ...trustedHookValues]
+    };
   }
 
   private walletPnlIgnoredTokenWhere(): { sql: string; args: SQLInputValue[] } {

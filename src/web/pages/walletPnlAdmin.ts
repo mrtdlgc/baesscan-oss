@@ -168,7 +168,6 @@ export function walletPnlAdminPage(options: WalletPnlAdminPageOptions): string {
           <a href="/intel/wallet-pnl/pools"><span class="nav-icon">U</span>Pools</a>
           <a href="/intel/wallet-pnl/status"><span class="nav-icon">S</span>Status</a>
           <a href="/"><span class="nav-icon">B</span>Buybot</a>
-          <a href="/intel/wallet-pnl?logout=1"><span class="nav-icon">L</span>Logout</a>
         </nav>
         <div class="side-block">
           <p>Status</p>
@@ -202,7 +201,7 @@ export function walletPnlAdminPage(options: WalletPnlAdminPageOptions): string {
       </div>
     </div>
   `, {
-    description: `${chainName} wallet PnL, realized exits, retained-window flow, and token-gated holder intel from baes scan.`,
+    description: `${chainName} wallet PnL, realized exits, retained-window flow, and wallet intel from baes scan.`,
     canonicalPath: "/intel/wallet-pnl",
     imagePath: "/og/baes-intel.png",
     robots: "noindex, nofollow"
@@ -315,7 +314,7 @@ function renderEmptyState(chain: ChainSlug, cursor?: WalletPnlCursor): string {
           <h2 id="walletPnlEmptyTitle">No snapshot yet</h2>
           <span class="source-pill is-warning">Waiting</span>
         </div>
-        <p>The page is gated and ready, but the ${escapeText(getChain(chain).name)} wallet-PnL indexer has not saved a snapshot yet.</p>
+        <p>The page is ready, but the ${escapeText(getChain(chain).name)} wallet-PnL indexer has not saved a snapshot yet.</p>
       </div>
       <dl class="admin-metrics">
         <div><dt>Cursor</dt><dd>${cursor?.lastBlock !== undefined ? cursor.lastBlock.toLocaleString() : "-"}</dd></div>

@@ -87,6 +87,13 @@ export const MARKET_SEEDS_BY_CHAIN: Partial<Record<ChainSlug, Array<{ address: A
     { address: "0x587f6eeafc7ad567e96ed1b62775fa6402164b22", dex: "kumbaya" },
     { address: "0xc2fac0b5b6c075819e654bcfbbbcda2838609d32", dex: "prism" },
     { address: "0x4b183a49963f98b3c8ffb4a7e9248defc278cd95", dex: "noxa" }
+  ],
+  robinhood: [
+    { address: "0x52e65b17fb6e5ba00ed806f37afcd2daa50271ca", dex: "uniswap" },
+    { address: "0x69bfaf19c9f377bb306a89aed9f6b07e2c1a8d9a", dex: "uniswap" },
+    { address: "0xd95e8e2cd04c207625c6f23c974d365a5f3a91d3", dex: "uniswap" },
+    { address: "0x88a8e96e7785d378825e8b5d7fc0e6f62487061e", dex: "pancakeswap" },
+    { address: "0xd3944d05aeed7de88a987901625b8ea39241163f", dex: "sushiswap" }
   ]
 };
 
@@ -97,7 +104,8 @@ export const BLOCK_SECONDS_BY_CHAIN: Partial<Record<ChainSlug, number>> = {
   optimism: 2,
   bsc: 3,
   polygon: 2,
-  avalanche: 2
+  avalanche: 2,
+  robinhood: 0.1
 };
 
 export const DEFAULT_TRENDING_CACHE_MS = 45_000;

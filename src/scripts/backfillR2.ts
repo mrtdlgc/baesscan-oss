@@ -4,6 +4,7 @@ import { backfillRpcProvidersEnvName, loadEnv } from "../config/env";
 import { createBackfillRpcPool } from "../services/backfillRpc";
 import { createAbortableJsonRpcProvider } from "../services/abortableRpcProvider";
 import { PriceService } from "../services/price";
+import { DexscreenerClient } from "../services/dexscreener";
 import { R2SnapshotStore, createMarketArchiveChunk } from "../services/r2Snapshots";
 import type { R2ArchiveManifest, R2ArchiveObject } from "../services/r2Snapshots";
 import { RpcPool } from "../services/rpcPool";
@@ -46,7 +47,12 @@ async function main(): Promise<void> {
     urls
   );
   const rpcs = new Map<ChainSlug, RpcPool>([[args.chain, rpc]]);
-  const priceService = new PriceService({ ethUsdOverride: env.ethUsdOverride, disableCoinGecko: env.disableCoinGecko, rpcs });
+  const priceService = new PriceService({
+    ethUsdOverride: env.ethUsdOverride,
+    disableCoinGecko: env.disableCoinGecko,
+    rpcs,
+    dexscreener: new DexscreenerClient({ enabled: !env.disableDexscreener })
+  });
   const generatedAt = new Date();
   const retentionDays = env.marketHistoryRetentionDays;
 

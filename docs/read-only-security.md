@@ -13,17 +13,22 @@ From the configured chain RPCs:
 - Pair / pool swap logs in bounded ranges
 - ERC-20 metadata (`name`, `symbol`, `decimals`, `totalSupply`)
 - Transaction and block details for sender attribution
-- `balanceOf` for the optional intel holder gate
 
 From Blockscout (when `BLOCKSCOUT_API_KEY` is set):
 
 - `getcontractcreation` for contract-creator lookups
+- Token transfer history (`tokentx`) and transaction logs for `/watch` / `/scan` pool discovery and wallet-PnL historical lookups
 - Bounded log ranges for optional wallet-PnL pool discovery and optional archive ingestion
 
 From Telegram:
 
 - Messages and updates in chats it has been added to
 - `getChat` to resolve titles, usernames, and invite links (only what Telegram exposes to bots)
+
+From public price APIs (no key, only token/pair addresses are sent):
+
+- CoinGecko for native-asset USD prices and as a fallback for non-standard quote tokens (`DISABLE_COINGECKO=true` to turn off)
+- Dexscreener for alert market cap and USD prices of non-standard quote tokens (`DISABLE_DEXSCREENER=true` to turn off)
 
 From GeckoTerminal: optionally embedded as a chart frame on web pages, not used for pool discovery or alert data.
 
@@ -63,7 +68,6 @@ Not stored:
 | `*_RPC_URLS` | Read chain state | env only | Rotate at the RPC provider dashboard |
 | `BLOCKSCOUT_API_KEY` | Optional contract-creator and archive lookups | env only | Rotate at Blockscout |
 | `R2_*` | Optional market archive storage | env only | Rotate at Cloudflare |
-| `INTEL_SESSION_SECRET` | Optional gated `/intel` session cookies | env only | Set a new value and redeploy |
 | `WEB_ADMIN_PASSWORD` | Optional `/admin/copy-shadow` page | env only | Set a new value and redeploy |
 
 None of these are persisted to the SQLite database. Revoking the source credential and restarting the process is sufficient.

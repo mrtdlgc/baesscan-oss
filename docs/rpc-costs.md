@@ -8,6 +8,7 @@ If you are scanning a single quiet Base group, costs are negligible. If you turn
 
 - The Telegram bot itself: a few RPC reads per group per polling tick.
 - `/pool` manual entry: zero discovery cost.
+- `/watch` and `/scan` discovery: bounded by `POOL_SCAN_LOOKBACK_BLOCKS`. With a Blockscout key, discovery starts from indexed token transfers and usually skips the chunked RPC log scan.
 - `/api/chains`: static registry, no RPC.
 - Contract-creator lookups: one or two RPC calls per address, or one Blockscout call when configured.
 - A no-secret `WEB_ENABLED=true` boot: the landing page does not call RPCs.
@@ -26,9 +27,13 @@ The features below either issue many requests per scan tick or replay large bloc
 
 Per-tx sender lookups dominate when block-level lookups miss. Public RPCs frequently throttle this pattern.
 
+The number of pools scanned per tick is capped by `WALLET_PNL_MAX_POOLS_PER_TICK` (default 5000; seed pools first, then pools with recent trades). `WALLET_PNL_SCAN_POOL_SOURCES` can restrict scanning to a subset of `seed,factory,blockscout`. On Base, Uniswap v4 pools without a trusted launchpad hook are never scanned, which keeps spam-hook pools from eating the budget. During catch-up, turn off active pool discovery and token bootstrap until the cursor is close to chain head.
+
 ### Active pool discovery
 
 `WALLET_PNL_ACTIVE_POOL_DISCOVERY_ENABLED=true` calls Blockscout on every tick to find new active v4 pool ids. Without a Blockscout PRO key, you will hit anonymous rate limits quickly.
+
+All Blockscout traffic shares one serialized queue paced by `BLOCKSCOUT_REQUEST_DELAY_MS` (default 1000) and `BLOCKSCOUT_MAX_REQUESTS_PER_TICK` (default 60). If you still see 429s, raise the delay or turn off `WALLET_PNL_BLOCKSCOUT_TOKEN_BOOTSTRAP_ENABLED`, `WALLET_PNL_BLOCKSCOUT_CREATOR_LOOKUP_ENABLED`, or `WALLET_PNL_BLOCKSCOUT_HISTORICAL_BACKFILL_ENABLED`.
 
 ### Token bootstrap
 
@@ -48,7 +53,7 @@ Per-tx sender lookups dominate when block-level lookups miss. Public RPCs freque
 2. Does it call Blockscout on every tick? If yes, do you have a paid key?
 3. Does the worst-case cold cache load fan out a backfill on the first user request?
 4. Will it run after `npm start` even if I do not open any web page? Many wallet-PnL knobs do.
-5. Can I gate it behind `WEB_ADMIN_PASSWORD`, `OWNER_USER_IDS`, or `WALLET_PNL_GATE_*`?
+5. Can I keep it behind `WEB_ADMIN_PASSWORD` or `OWNER_USER_IDS`, or switch it off entirely with `INTEL_ENABLED=false`?
 
 ## Provider quota tips
 

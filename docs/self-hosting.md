@@ -39,6 +39,8 @@ TELEGRAM_ENABLED=false WEB_ENABLED=true npm start
 3. Set `OWNER_USER_IDS` to your Telegram numeric user id. Owner ids also receive DM alerts when the bot joins or leaves a chat — each owner must open the bot once before Telegram will accept bot-initiated DMs.
 4. For VPS / bare-metal, keep `TELEGRAM_MODE=polling`. For platforms with public ingress (Railway, Fly, Cloud Run, Render, Coolify with a public domain), prefer `TELEGRAM_MODE=webhook` and set `PUBLIC_BASE_URL` so the app can register the webhook automatically.
 
+Group admins who post with "Remain Anonymous" can run write commands. When a basic group is upgraded to a supergroup, the bot moves the stored config to the new chat id on its own.
+
 Run **exactly one** replica per bot token. Long polling cannot be duplicated and webhook mode must have a single active receiver.
 
 ## Telegram commands (quick reference)
@@ -116,7 +118,13 @@ BLOCKSCOUT_API_BASE_URL=https://api.blockscout.com/v2/api
 BLOCKSCOUT_LOG_SOURCE=disabled   # or fallback / preferred
 ```
 
-Used for contract-creator lookups, optional wallet-PnL pool bootstrap, and optional archive log ingestion. Read [docs/rpc-costs.md](rpc-costs.md) before enabling `preferred`.
+Used for `/watch` and `/scan` pool discovery (indexed token transfers first, raw RPC scan as fallback), contract-creator lookups, optional wallet-PnL pool bootstrap, and optional archive log ingestion. Read [docs/rpc-costs.md](rpc-costs.md) before enabling `preferred`.
+
+All Blockscout calls go through one serialized in-process queue, paced by `BLOCKSCOUT_REQUEST_DELAY_MS` (default 1000) and `BLOCKSCOUT_MAX_REQUESTS_PER_TICK` (default 60). Wallet-PnL has separate switches for its Blockscout work: `WALLET_PNL_BLOCKSCOUT_TOKEN_BOOTSTRAP_ENABLED`, `WALLET_PNL_BLOCKSCOUT_CREATOR_LOOKUP_ENABLED`, and `WALLET_PNL_BLOCKSCOUT_HISTORICAL_BACKFILL_ENABLED`.
+
+## Prices
+
+Native-asset USD prices come from CoinGecko with a Chainlink fallback. Dexscreener supplies the market cap shown in buy alerts and, with CoinGecko as a fallback, USD prices for quote tokens that are neither stablecoins nor the chain's native asset. Set `DISABLE_COINGECKO=true` or `DISABLE_DEXSCREENER=true` to turn either off; alerts then fall back to on-chain FDV, or show no USD value when a quote token has no other price source.
 
 ## Optional: web and intel surface
 
@@ -126,7 +134,7 @@ WEB_PORT=3000
 PUBLIC_BASE_URL=https://your-host.example
 ```
 
-The intel surface is **off** by default in the OSS edition (no token gate configured). If you want a holder gate, set `WALLET_PNL_GATE_TOKEN_ADDRESS`, `WALLET_PNL_GATE_CHAIN` (must be in `ENABLED_CHAINS`), and `WALLET_PNL_GATE_MIN_BALANCE`. Set `INTEL_SESSION_SECRET` to a long random string for signed gate cookies.
+The `/intel` pages are open in the OSS edition. They stay empty until the wallet-PnL indexer runs (`WALLET_PNL_ENABLED=true`). Set `INTEL_ENABLED=false` to remove `/intel` and the copy-shadow admin page and to stop every intel background job.
 
 ## Optional: wallet-PnL alpha
 
@@ -138,7 +146,7 @@ Off by default. Enable only if you have R2 credentials and RPC capacity for hist
 
 ## Storage
 
-SQLite is the default and is acceptable for alpha use. Persist `data/state.db` to durable storage. Back it up with `sqlite3 .backup` rather than copying a live DB file. The wallet-PnL gated analytics path is designed for SQLite; the JSON fallback (`STORAGE_BACKEND=json`) is intended for local development only.
+SQLite is the default and is acceptable for alpha use. Persist `data/state.db` to durable storage. Back it up with `sqlite3 .backup` rather than copying a live DB file. The wallet-PnL analytics path is designed for SQLite; the JSON fallback (`STORAGE_BACKEND=json`) is intended for local development only.
 
 ## Deployment patterns
 

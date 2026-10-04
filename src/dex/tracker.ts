@@ -11,6 +11,7 @@ import { normalizeAddress } from "../utils/address";
 import { formatTokenAmount } from "../utils/format";
 import { getOtherCurrency } from "./uniswap";
 import { sendBuyNotification } from "../bot/messages";
+import { migrateChatId, migrateTargetFromError } from "../bot/chatMigration";
 import { parseBuySwap } from "./swapParsers";
 import { fetchSwapLogs, poolIdForSwapLog, uniquePools } from "./swapLogs";
 import {
@@ -127,10 +128,10 @@ export class SwapTracker {
 
           const tokenAmountNumber = Number(event.tokenAmount);
           const token = current.token;
-          const priceUsd = quoteUsd !== undefined && tokenAmountNumber > 0 ? quoteUsd / tokenAmountNumber : undefined;
-          const fdvUsd = priceUsd !== undefined && token.totalSupply
-            ? Number(formatUnits(BigInt(token.totalSupply), token.decimals)) * priceUsd
-            : undefined;
+          const swapPriceUsd = quoteUsd !== undefined && tokenAmountNumber > 0 ? quoteUsd / tokenAmountNumber : undefined;
+          const valuation = await this.priceService.marketValuation("solana", { tokenAddress: mint });
+          const priceUsd = swapPriceUsd ?? valuation?.priceUsd;
+          const fdvUsd = fdvFromSupply(token, swapPriceUsd) ?? valuation?.fdvUsd;
           await sendBuyNotification(this.bot.telegram, current, {
             chatId: current.chatId,
             chain: "solana",
@@ -144,6 +145,7 @@ export class SwapTracker {
             quoteUsd,
             priceUsd,
             fdvUsd,
+            marketCapUsd: valuation?.marketCapUsd,
             buyer: event.buyer,
             sender: event.buyer,
             txHash: event.signature,
@@ -307,11 +309,15 @@ export class SwapTracker {
 
     const tokenAmountRaw = parsedSwap.tokenAmountRaw;
     const tokenAmountNumber = Number(formatUnits(tokenAmountRaw, token.decimals));
-    const priceUsd = quoteUsd !== undefined && tokenAmountNumber > 0 ? quoteUsd / tokenAmountNumber : undefined;
-    const fdvUsd = priceUsd !== undefined && token.totalSupply
-      ? Number(formatUnits(BigInt(token.totalSupply), token.decimals)) * priceUsd
-      : undefined;
-    if (fdvUsd === undefined) {
+    const swapPriceUsd = quoteUsd !== undefined && tokenAmountNumber > 0 ? quoteUsd / tokenAmountNumber : undefined;
+    const valuation = await this.priceService.marketValuation(chain, {
+      tokenAddress: token.address,
+      pairId: pool.poolAddress ?? pool.id
+    });
+    const priceUsd = swapPriceUsd ?? valuation?.priceUsd;
+    const fdvUsd = fdvFromSupply(token, swapPriceUsd) ?? valuation?.fdvUsd;
+    const marketCapUsd = valuation?.marketCapUsd;
+    if (fdvUsd === undefined && marketCapUsd === undefined) {
       this.logger.warn(
         {
           chain,
@@ -324,9 +330,10 @@ export class SwapTracker {
           quoteSymbol: quote.symbol,
           hasQuoteUsd: quoteUsd !== undefined,
           hasPriceUsd: priceUsd !== undefined,
-          hasTotalSupply: Boolean(token.totalSupply)
+          hasTotalSupply: Boolean(token.totalSupply),
+          hasMarketData: valuation !== undefined
         },
-        "buy alert fdv unavailable"
+        "buy alert market cap unavailable"
       );
     }
 
@@ -345,6 +352,7 @@ export class SwapTracker {
       quoteUsd,
       priceUsd,
       fdvUsd,
+      marketCapUsd,
       buyer,
       buyerEthBalance,
       sender: parsedSwap.sender,
@@ -357,6 +365,13 @@ export class SwapTracker {
       await sendBuyNotification(this.bot.telegram, chat, event);
       this.logger.info({ chatId: chat.chatId, txHash: event.txHash, poolId: pool.id }, "sent buy notification");
     } catch (error) {
+      // A basic group that was upgraded to a supergroup answers with the new chat id.
+      // Move the record across instead of failing on every buy from here on.
+      const migrateTo = migrateTargetFromError(error);
+      if (migrateTo !== undefined) {
+        await migrateChatId(this.store, this.logger, chat.chatId, migrateTo);
+        return;
+      }
       this.logger.error({ error, chatId: chat.chatId, txHash: event.txHash }, "failed to send Telegram notification");
     }
   }
@@ -473,4 +488,16 @@ function chatsByPoolId(chats: ChatState[]): Map<string, ChatState[]> {
     }
   }
   return out;
+}
+
+/** Fully diluted valuation from on-chain total supply and the executed swap price. */
+function fdvFromSupply(token: TokenMetadata, priceUsd: number | undefined): number | undefined {
+  if (priceUsd === undefined || !token.totalSupply) return undefined;
+  try {
+    const supply = Number(formatUnits(BigInt(token.totalSupply), token.decimals));
+    if (!Number.isFinite(supply) || supply <= 0) return undefined;
+    return supply * priceUsd;
+  } catch {
+    return undefined;
+  }
 }

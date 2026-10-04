@@ -4,7 +4,7 @@ import { chainLabel } from "../../chains/registry";
 import { isMarketBoardChain } from "../marketChains";
 import { publicChains } from "../publicChains";
 import { marketScript } from "./landingScript";
-import { blockscoutPoweredLink, escapeAttr, escapeText, page } from "./shared";
+import { OSS_REPO_URL, blockscoutPoweredLink, escapeAttr, escapeText, page } from "./shared";
 
 interface LandingPageDeps {
   env: Pick<
@@ -13,6 +13,7 @@ interface LandingPageDeps {
     | "rpcUrlsByChain"
     | "publicMarketApiBase"
     | "marketsEnabled"
+    | "intelEnabled"
     | "walletPnlEnabled"
     | "walletPnlNewTokensIntervalMs"
   >;
@@ -50,7 +51,7 @@ export function landingPage(deps: LandingPageDeps): string {
         <a class="brand-mark" href="/"><span>baes</span><strong>scan</strong></a>
         <nav class="side-nav">
           <a class="is-active" href="#top"><span class="nav-icon">B</span>Buybot</a>
-          <a href="/intel"><span class="nav-icon">I</span>Intel</a>
+          ${deps.env.intelEnabled ? `<a href="/intel"><span class="nav-icon">I</span>Intel</a>` : ""}
           <a href="#coverage"><span class="nav-icon">C</span>Coverage</a>
           <a href="#setup"><span class="nav-icon">S</span>Setup</a>
           ${deps.env.marketsEnabled ? `<a href="#market-board"><span class="nav-icon">M</span>Markets</a>` : ""}
@@ -61,7 +62,8 @@ export function landingPage(deps: LandingPageDeps): string {
         </div>
         <div class="side-block">
           <p>Resources</p>
-          <a class="side-link" href="/intel">Holder Intel</a>
+          ${deps.env.intelEnabled ? `<a class="side-link" href="/intel">Holder Intel</a>` : ""}
+          <a class="side-link" href="${OSS_REPO_URL}" target="_blank" rel="noreferrer">GitHub repo</a>
           ${deps.env.marketsEnabled ? `<a class="side-link" id="apiLink" href="${escapeAttr(`${deps.env.publicMarketApiBase ?? ""}/api/trending/${initialChain}`)}">API JSON</a>` : ""}
           <a class="side-link" href="/health">Health</a>
         </div>
@@ -76,13 +78,15 @@ export function landingPage(deps: LandingPageDeps): string {
             ${blockscoutPoweredLink("blockscout-hero-badge")}
             <div class="landing-actions">
               <a class="button-link is-primary" href="https://t.me/BAESBuyBot" target="_blank" rel="noreferrer">Open @BAESBuyBot</a>
-              <a class="ghost-link" href="/intel">Open Intel</a>
+              ${deps.env.intelEnabled ? `<a class="ghost-link" href="/intel">Open Intel</a>` : ""}
+              <a class="ghost-link" href="${OSS_REPO_URL}" target="_blank" rel="noreferrer">View source</a>
               ${deps.env.marketsEnabled ? `<a class="ghost-link" href="#market-board">View markets</a>` : ""}
             </div>
             <div class="landing-proof" aria-label="Product highlights">
               <span>Read-only alerts</span>
               <span>Pool IDs and exact pools</span>
               <span>Telegram topics</span>
+              <span>Open source alpha</span>
               <span>Free to try</span>
             </div>
           </div>
@@ -113,9 +117,9 @@ export function landingPage(deps: LandingPageDeps): string {
           </div>
         </section>
 
-        <section class="coverage-band" id="intel-preview" aria-labelledby="intelPreviewTitle">
+        ${deps.env.intelEnabled ? `<section class="coverage-band" id="intel-preview" aria-labelledby="intelPreviewTitle">
           <div class="section-heading">
-            <p class="eyebrow">Holder intel</p>
+            <p class="eyebrow">Self-hosted intel</p>
             <h2 id="intelPreviewTitle">Wallet clusters and new-token analysis.</h2>
             <p>Open <code>/intel</code> for wallet PnL, risk clusters, cohort overlap, and a New Tokens view that refreshes from a cached ${escapeText(intelCadence)} analysis without blocking the site.</p>
           </div>
@@ -133,9 +137,10 @@ export function landingPage(deps: LandingPageDeps): string {
               <span>Overlap</span>
               <span>Cohort</span>
               <span>${escapeText(deps.env.walletPnlEnabled ? "Indexer live" : "Indexer paused")}</span>
+              <span>Open access</span>
             </div>
           </div>
-        </section>
+        </section>` : ""}
 
         <section class="function-grid" aria-labelledby="functionTitle">
           <div class="section-heading">
@@ -166,7 +171,7 @@ export function landingPage(deps: LandingPageDeps): string {
             <article class="feature-card">
               <span>05</span>
               <h3>Multi-chain coverage</h3>
-              <p>Use one setup language across Base, Ethereum, BSC, Arbitrum, Optimism, Polygon, Avalanche, Monad, and MegaETH.</p>
+              <p>Use one setup language across Base, Ethereum, BSC, Arbitrum, Optimism, Polygon, Avalanche, Monad, MegaETH, and Robinhood Chain.</p>
             </article>
             <article class="feature-card">
               <span>06</span>
@@ -192,10 +197,11 @@ export function landingPage(deps: LandingPageDeps): string {
               <span>Avalanche</span>
               <span>Monad</span>
               <span>MegaETH</span>
+              <span>Robinhood Chain</span>
             </div>
             <div class="protocol-panel">
               <h3>Supported route families</h3>
-              <p>Uniswap v2/v3/v4, PancakeSwap v2/v3, SushiSwap v2, Aerodrome and Velodrome, Hydrex, Camelot, THENA, QuickSwap, Trader Joe, Pharaoh, Blackhole, Pangolin, Curve, and Balancer.</p>
+              <p>Uniswap v2/v3/v4, PancakeSwap v2/v3, SushiSwap v2/v3, Aerodrome and Velodrome, Hydrex, Camelot, THENA, QuickSwap, Trader Joe, Pharaoh, Blackhole, Pangolin, Curve, and Balancer.</p>
             </div>
           </div>
         </section>
@@ -291,7 +297,9 @@ export function landingPage(deps: LandingPageDeps): string {
     </div>
     ${deps.env.marketsEnabled ? `<script>${marketScript(deps.env.publicMarketApiBase, chainNames, initialChain)}</script>` : ""}
   `, {
-    description: "baes scan is a Telegram-first buybot for pool-aware DEX buy alerts, route-specific setup, and token-gated holder intel.",
+    description: deps.env.intelEnabled
+      ? "baes scan is a Telegram-first buybot for pool-aware DEX buy alerts, route-specific setup, and open wallet intel."
+      : "baes scan is a Telegram-first buybot for pool-aware DEX buy alerts and route-specific token launch setup.",
     canonicalPath: "/",
     imagePath: "/og/baes-scan.png"
   });

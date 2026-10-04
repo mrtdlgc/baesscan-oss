@@ -105,7 +105,9 @@ export class CopyShadowSimulator {
       }
       const snapshot = buildCopyShadowSnapshotFromConfig({
         config,
-        trades: this.deps.store.getWalletPnlTrades(config.chain)
+        trades: this.deps.store.getWalletPnlTrades(config.chain, undefined, {
+          trustedV4Hooks: this.deps.env.walletPnlTrustedV4Hooks
+        })
       });
       this.deps.store.setCopyShadowSnapshot(snapshot);
       if (reason === "startup" || reason === "interval") this.lastIntervalRunAtMs = Date.now();

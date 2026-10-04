@@ -146,7 +146,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
       return next();
     }
 
-    if (!(await isAdmin(ctx, deps.env, deps.store))) {
+    if (!(await isAdmin(ctx, deps.env, deps.store, deps.logger))) {
       pendingGuidedSetup.delete(pendingKey);
       await ctx.reply("Only a group admin can set up buy alerts.");
       return;
@@ -180,7 +180,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
       return next();
     }
 
-    if (!(await isAdmin(ctx, deps.env, deps.store))) {
+    if (!(await isAdmin(ctx, deps.env, deps.store, deps.logger))) {
       pendingSettings.delete(pendingKey);
       await ctx.reply("Only a group admin can change settings.");
       return;
@@ -204,7 +204,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
   bot.help((ctx) => ctx.reply(HELP_TEXT));
   bot.command("help", (ctx) => ctx.reply(HELP_TEXT));
 
-  bot.command("scan", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("scan", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     try {
       const args = argsOf(ctx);
       const parsed = parseWatchArgs(args, deps.env);
@@ -226,6 +226,8 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
         token: parsed.token,
         action: "scan"
       });
+      const foundPoolIds = new Set<string>();
+      reporter.setFound(0);
       const pools = await discoverPools(runtime.rpc, {
         chain: parsed.chain,
         poolManagerAddress: deps.env.poolManagerAddresses[parsed.chain],
@@ -238,7 +240,13 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
         chunkSize: deps.env.logChunkSize,
         onlyClankerHooks,
         hookFilter,
-        onProgress: reporter.onProgress
+        blockscoutClient: deps.blockscoutClient,
+        logger: deps.logger,
+        onProgress: reporter.onProgress,
+        onPoolFound: (pool) => {
+          foundPoolIds.add(pool.id.toLowerCase());
+          reporter.setFound(foundPoolIds.size);
+        }
       });
       await reporter.finish(pools.length);
       await replyLong(ctx, `Found ${pools.length} pool(s).\n\n${poolsSummary(pools, 10, { fullIdentifiers: true })}`);
@@ -247,7 +255,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     }
   });
 
-  bot.command("watch", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("watch", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     try {
       const args = argsOf(ctx);
       if (args.length === 0) {
@@ -317,6 +325,8 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
         action: "watch"
       });
       let droppedAtCap = 0;
+      const foundPoolIds = new Set<string>();
+      reporter.setFound(0);
       const pools = await discoverPools(runtime.rpc, {
         chain: parsed.chain,
         poolManagerAddress: deps.env.poolManagerAddresses[parsed.chain],
@@ -329,10 +339,14 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
         chunkSize: deps.env.logChunkSize,
         onlyClankerHooks,
         hookFilter,
+        blockscoutClient: deps.blockscoutClient,
+        logger: deps.logger,
         stopOnFirst: parsed.scanMode !== "all",
         excludePoolIds,
         onProgress: reporter.onProgress,
         onPoolFound: async (pool) => {
+          foundPoolIds.add(pool.id.toLowerCase());
+          reporter.setFound(foundPoolIds.size);
           const current = deps.store.getChat(ctx.chat!.id);
           if (!isCurrentTrackedChat(current, parsed.chain, token.address)) return;
           if (Object.keys(current.pools).length >= deps.env.maxPoolsPerChat) {
@@ -401,7 +415,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     }
   });
 
-  bot.command("pool", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("pool", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     try {
       const rawArgs = argsOf(ctx);
       if (rawArgs.length === 0) {
@@ -477,21 +491,21 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     }
   });
 
-  bot.command("pools", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("pools", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     const chat = deps.store.getChat(ctx.chat!.id);
     if (!chat || Object.keys(chat.pools).length === 0) return ctx.reply("No pools configured yet. Use /watch or /pool.");
     if (chat.chain === "solana") return ctx.reply(`${SOLANA_DISABLED_MESSAGE}\n\nUse /unwatch before setting up a supported EVM chain.`);
     return replyLong(ctx, poolsSummary(Object.values(chat.pools), 25, { fullIdentifiers: true }));
   });
 
-  bot.command("settings", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("settings", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     const chat = deps.store.getChat(ctx.chat!.id);
     if (!chat) return ctx.reply("No settings yet. Use /watch first.");
     if (chat.chain === "solana") return ctx.reply(`${SOLANA_DISABLED_MESSAGE}\n\nUse /unwatch before setting up a supported EVM chain.`);
     return ctx.reply(settingsSummary(chat), settingsKeyboard(chat));
   });
 
-  bot.command("status", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("status", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     const chat = deps.store.getChat(ctx.chat!.id);
     const chain = chat?.chain ?? deps.env.primaryChain;
     if (chain === "solana") return ctx.reply(`${SOLANA_DISABLED_MESSAGE}\n\nUse /unwatch before setting up a supported EVM chain.`);
@@ -528,7 +542,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     }
   });
 
-  bot.command("topic", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("topic", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     try {
       const args = argsOf(ctx);
       const chat = deps.store.ensureChat(ctx.chat!.id, chatTitle(ctx));
@@ -541,7 +555,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     }
   });
 
-  bot.command("pause", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("pause", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     const chat = deps.store.ensureChat(ctx.chat!.id, chatTitle(ctx));
     chat.enabled = false;
     deps.store.setChat(chat);
@@ -549,7 +563,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     await ctx.reply("Paused buy notifications for this chat.");
   });
 
-  bot.command("resume", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("resume", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     const chat = deps.store.getChat(ctx.chat!.id);
     if (!chat || !chat.tokenAddress || Object.keys(chat.pools).length === 0) {
       await ctx.reply("Nothing to resume. Use /watch first.");
@@ -573,13 +587,13 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     await ctx.reply(`Resumed from block ${current.lastBlock}.`);
   });
 
-  bot.command("unwatch", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("unwatch", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     deps.store.deleteChat(ctx.chat!.id);
     await deps.store.save();
     await ctx.reply("Removed all configuration for this chat.");
   });
 
-  bot.command("set", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("set", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     try {
       const args = argsOf(ctx);
       if (args.length < 2) throw new Error("Usage: /set <key> <value>");
@@ -610,7 +624,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     const isSettingsUpload = pending?.key === "mediaupload" || pending?.key === "media";
     const isCaptionUpload = Boolean(caption && /^\/?set\s*media\b/i.test(caption.trim()));
     if (!isSettingsUpload && !isCaptionUpload) return;
-    if (!(await isAdmin(ctx, deps.env, deps.store))) {
+    if (!(await isAdmin(ctx, deps.env, deps.store, deps.logger))) {
       if (pendingKey) pendingSettings.delete(pendingKey);
       await ctx.reply("Only a group admin can change settings.");
       return;
@@ -652,7 +666,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     }
   });
 
-  bot.command("testbuy", adminOnly(deps.env, deps.store), async (ctx) => {
+  bot.command("testbuy", adminOnly(deps.env, deps.store, deps.logger), async (ctx) => {
     try {
       const chat = deps.store.getChat(ctx.chat!.id);
       if (!chat || !chat.tokenAddress || !chat.token || Object.keys(chat.pools).length === 0) {
@@ -674,6 +688,10 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
           ? (Number(quoteRaw) / Number(tenPow(quote.decimals))) * usdMultiplier
           : undefined;
       const priceUsd = quoteUsd !== undefined ? quoteUsd / 1000 : undefined;
+      const valuation = await deps.priceService.marketValuation(chain, {
+        tokenAddress: chat.token.address,
+        pairId: pool.poolAddress ?? pool.id
+      });
       const event: BuyEvent = {
         chatId: chat.chatId,
         chain,
@@ -689,7 +707,8 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
         fdvUsd:
           priceUsd && chat.token.totalSupply
             ? (Number(chat.token.totalSupply) / Number(tenPow(chat.token.decimals))) * priceUsd
-            : undefined,
+            : valuation?.fdvUsd,
+        marketCapUsd: valuation?.marketCapUsd,
         buyer: "0x000000000000000000000000000000000000bEEF" as Address,
         txHash: "0x000000000000000000000000000000000000000000000000000000000000bEEF",
         blockNumber: await runtime.rpc.getBlockNumber(),
@@ -727,6 +746,10 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
   });
 
   bot.command(OWNER_COMMANDS.walletPnl, ownerOnly(deps.env), async (ctx) => {
+    if (!deps.env.intelEnabled) {
+      await ctx.reply("Intel is disabled. Set INTEL_ENABLED=true before using Wallet PnL diagnostics.");
+      return;
+    }
     const snapshot = deps.store.getWalletPnlSnapshot(deps.env.walletPnlChain);
     if (!snapshot) {
       await ctx.reply(
@@ -844,7 +867,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
 
   bot.action(/^setup:(.+)$/, async (ctx) => {
     try {
-      if (!(await isAdmin(ctx, deps.env, deps.store))) {
+      if (!(await isAdmin(ctx, deps.env, deps.store, deps.logger))) {
         await ctx.answerCbQuery("Admins only", { show_alert: true });
         return;
       }
@@ -860,7 +883,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
   // Inline keyboard actions for /settings.
   bot.action(/^cfg:(.+)$/, async (ctx) => {
     try {
-      if (!(await isAdmin(ctx, deps.env, deps.store))) {
+      if (!(await isAdmin(ctx, deps.env, deps.store, deps.logger))) {
         await ctx.answerCbQuery("Admins only", { show_alert: true });
         return;
       }
@@ -1221,7 +1244,7 @@ async function handleGuidedSetupText(
       return;
     }
     pending.delete(pendingKey);
-    await executeGuidedWatch(ctx, deps, [state.chain, state.token, "any", text.trim(), "all"], controls);
+    await executeGuidedWatch(ctx, deps, [state.chain, state.token, "any", text.trim()], controls);
     return;
   }
 
@@ -1408,6 +1431,8 @@ async function executeGuidedWatch(
     action: "watch"
   });
   let droppedAtCap = 0;
+  const foundPoolIds = new Set<string>();
+  reporter.setFound(0);
   const pools = await discoverPools(runtime.rpc, {
     chain: parsed.chain,
     poolManagerAddress: deps.env.poolManagerAddresses[parsed.chain],
@@ -1420,10 +1445,14 @@ async function executeGuidedWatch(
     chunkSize: deps.env.logChunkSize,
     onlyClankerHooks,
     hookFilter,
+    blockscoutClient: deps.blockscoutClient,
+    logger: deps.logger,
     stopOnFirst: parsed.scanMode !== "all",
     excludePoolIds,
     onProgress: reporter.onProgress,
     onPoolFound: async (pool) => {
+      foundPoolIds.add(pool.id.toLowerCase());
+      reporter.setFound(foundPoolIds.size);
       const current = deps.store.getChat(ctx.chat!.id);
       if (!isCurrentTrackedChat(current, parsed.chain, token.address)) return;
       if (Object.keys(current.pools).length >= deps.env.maxPoolsPerChat) {
@@ -1669,7 +1698,8 @@ function dbRuntimeView(env: CommandDeps["env"]): string {
     `Web enabled: ${env.webEnabled ? "yes" : "no"}`,
     `Markets enabled: ${env.marketsEnabled ? "yes" : "no"}`,
     `Market archive: ${env.marketArchiveEnabled ? "on" : "off"}`,
-    `Wallet PnL: ${env.walletPnlEnabled ? `on (${env.walletPnlChain}, ${env.walletPnlRetentionDays}d retention)` : "off"}`,
+    `Intel enabled: ${env.intelEnabled ? "yes" : "no"}`,
+    `Wallet PnL: ${env.intelEnabled && env.walletPnlEnabled ? `on (${env.walletPnlChain}, ${env.walletPnlRetentionDays}d retention)` : "off"}`,
     `Uptime: ${Math.floor(process.uptime())}s`
   ].join("\n");
 }

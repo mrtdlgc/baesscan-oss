@@ -90,5 +90,6 @@ function dexscreenerChainSlug(chain: ChainSlug): string | undefined {
   if (chain === "optimism") return "optimism";
   if (chain === "polygon") return "polygon";
   if (chain === "avalanche") return "avalanche";
+  if (chain === "robinhood") return "robinhood";
   return undefined;
 }

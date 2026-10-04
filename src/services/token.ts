@@ -203,7 +203,9 @@ function knownTokenFallback(chain: ChainSlug, address: Address): Pick<TokenMetad
     "avalanche:0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e": { name: "USD Coin", symbol: "USDC", decimals: 6 },
     "avalanche:0x9702230a8ea53601f5cd2dc00fdbc13d4f4a8c7": { name: "Tether USD", symbol: "USDT", decimals: 6 },
     "bsc:0x55d398326f99059ff775485246999027b3197955": { name: "Tether USD", symbol: "USDT", decimals: 18 },
-    "bsc:0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": { name: "USD Coin", symbol: "USDC", decimals: 18 }
+    "bsc:0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": { name: "USD Coin", symbol: "USDC", decimals: 18 },
+    "robinhood:0x49d9face26a98c5e124f31fdcf387884fa659ec8": { name: "Circle USD", symbol: "USDC", decimals: 18 },
+    "robinhood:0x5fc5360d0400a0fd4f2af552add042d716f1d168": { name: "Global Dollar", symbol: "USDG", decimals: 6 }
   };
   return known[key];
 }

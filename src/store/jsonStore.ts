@@ -1,8 +1,10 @@
 import { copyFile, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { CHAIN_SLUGS } from "../chains/registry";
+import { walletPnlTradeHookPolicy } from "../services/walletPnlHookPolicy";
 import type { AppState, BannedChat, ChainSlug, ChatSettings, ChatState } from "../types";
 import { mergeWalletPnlClusterRecord } from "./storage";
+import { compareWalletPnlScanPools, walletPnlPoolMatchesScan } from "./walletPnlPoolScan";
 import type {
   ChatLastBlockUpdate,
   CopyShadowConfig,
@@ -18,8 +20,10 @@ import type {
   WalletPnlHistoricalTokenBuys,
   WalletPnlNewTokensSnapshot,
   WalletPnlPoolRecord,
+  WalletPnlPoolScanOptions,
   WalletPnlSnapshot,
   WalletPnlTokenCreatorRecord,
+  WalletPnlTradeReadOptions,
   WalletPnlTradeRecord
 } from "./storage";
 import { cloneAppState, cloneChat, cloneTokenInfo } from "./snapshots";
@@ -363,6 +367,24 @@ export class JsonStateStore implements Storage {
     return pools.slice(0, limit && limit > 0 ? limit : pools.length).map((record) => cloneWalletPnlPoolRecord(record)!);
   }
 
+  getWalletPnlScanPools(chain: ChainSlug, options?: WalletPnlPoolScanOptions): WalletPnlPoolRecord[] {
+    const lastTradeByPool = new Map<string, number>();
+    for (const trade of Object.values(this.state.walletPnlTrades ?? {})) {
+      if (trade.chain !== chain) continue;
+      if (options?.activeFromBlock !== undefined && trade.blockNumber < options.activeFromBlock) continue;
+      const poolId = trade.poolId.toLowerCase();
+      const previous = lastTradeByPool.get(poolId);
+      if (previous === undefined || trade.blockNumber > previous) lastTradeByPool.set(poolId, trade.blockNumber);
+    }
+    const pools = Object.values(this.state.walletPnlPools ?? {})
+      .filter((record) => record.chain === chain)
+      .map((record) => ({ record, lastTradeBlock: lastTradeByPool.get(record.poolId.toLowerCase()) }))
+      .filter((candidate) => walletPnlPoolMatchesScan(candidate.record, candidate.lastTradeBlock, options))
+      .sort(compareWalletPnlScanPools)
+      .map((candidate) => candidate.record);
+    return pools.slice(0, options?.limit && options.limit > 0 ? options.limit : pools.length).map((record) => cloneWalletPnlPoolRecord(record)!);
+  }
+
   getWalletPnlPool(chain: ChainSlug, poolId: string): WalletPnlPoolRecord | undefined {
     return cloneWalletPnlPoolRecord(this.state.walletPnlPools?.[walletPnlPoolKey(chain, poolId)]);
   }
@@ -405,26 +427,32 @@ export class JsonStateStore implements Storage {
     return keysToDelete.length;
   }
 
-  getWalletPnlTrades(chain: ChainSlug, fromBlock?: number): WalletPnlTradeRecord[] {
+  getWalletPnlTrades(chain: ChainSlug, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[] {
     return Object.values(this.state.walletPnlTrades ?? {})
       .filter((record) => record.chain === chain && (fromBlock === undefined || record.blockNumber >= fromBlock))
+      .filter((record) => this.walletPnlTradeAllowed(record, options))
       .sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex)
       .map(cloneWalletPnlTradeRecord);
   }
 
-  getWalletPnlTradesForToken(chain: ChainSlug, tokenAddress: string, fromBlock?: number): WalletPnlTradeRecord[] {
+  getWalletPnlTradesForToken(chain: ChainSlug, tokenAddress: string, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[] {
     const normalized = tokenAddress.toLowerCase();
-    return this.getWalletPnlTrades(chain, fromBlock).filter((record) => record.tokenAddress.toLowerCase() === normalized);
+    return this.getWalletPnlTrades(chain, fromBlock, options).filter((record) => record.tokenAddress.toLowerCase() === normalized);
   }
 
-  getWalletPnlTradesForWallet(chain: ChainSlug, wallet: string, fromBlock?: number): WalletPnlTradeRecord[] {
+  getWalletPnlTradesForWallet(chain: ChainSlug, wallet: string, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[] {
     const normalized = wallet.toLowerCase();
-    return this.getWalletPnlTrades(chain, fromBlock).filter((record) => record.wallet.toLowerCase() === normalized);
+    return this.getWalletPnlTrades(chain, fromBlock, options).filter((record) => record.wallet.toLowerCase() === normalized);
   }
 
-  getWalletPnlTradesForPool(chain: ChainSlug, poolId: string, fromBlock?: number): WalletPnlTradeRecord[] {
+  getWalletPnlTradesForPool(chain: ChainSlug, poolId: string, fromBlock?: number, options?: WalletPnlTradeReadOptions): WalletPnlTradeRecord[] {
     const normalized = poolId.toLowerCase();
-    return this.getWalletPnlTrades(chain, fromBlock).filter((record) => record.poolId.toLowerCase() === normalized);
+    return this.getWalletPnlTrades(chain, fromBlock, options).filter((record) => record.poolId.toLowerCase() === normalized);
+  }
+
+  private walletPnlTradeAllowed(record: WalletPnlTradeRecord, options?: WalletPnlTradeReadOptions): boolean {
+    const pool = this.state.walletPnlPools?.[walletPnlPoolKey(record.chain, record.poolId)]?.pool;
+    return walletPnlTradeHookPolicy(record.chain, record, pool, options?.trustedV4Hooks).allowed;
   }
 
   getWalletPnlCursor(chain: ChainSlug): WalletPnlCursor | undefined {

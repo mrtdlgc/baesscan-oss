@@ -432,10 +432,16 @@ export function createProgressReporter(ctx: Context, logger: Logger, info: Progr
   let lastLogUpdate = 0;
   let lastPercent = -1;
   let progressMsgId: number | undefined;
+  let foundPools: number | undefined;
+
+  const setFound = (matches: number) => {
+    foundPools = Math.max(foundPools ?? 0, matches);
+  };
 
   const onProgress = (p: { scanned: number; total: number; matches: number; currentChunk: number }) => {
     const percent = Math.min(100, Math.floor((p.scanned / p.total) * 100));
     const now = Date.now();
+    const matches = foundPools ?? p.matches;
 
     // Log every 5s - visible on Railway.
     if (now - lastLogUpdate > 5_000) {
@@ -446,7 +452,7 @@ export function createProgressReporter(ctx: Context, logger: Logger, info: Progr
           percent,
           scanned: p.scanned,
           total: p.total,
-          matches: p.matches,
+          matches,
           chunk: p.currentChunk,
           elapsedMs: now - start
         },
@@ -463,7 +469,7 @@ export function createProgressReporter(ctx: Context, logger: Logger, info: Progr
 
     const text =
       `Scanning ${percent}% (${p.scanned.toLocaleString()}/${p.total.toLocaleString()} blocks)\n` +
-      `Pools found: ${p.matches} | chunk ${p.currentChunk}`;
+      `Pools found: ${matches} | chunk ${p.currentChunk}`;
     void (async () => {
       try {
         if (progressMsgId === undefined) {
@@ -491,5 +497,5 @@ export function createProgressReporter(ctx: Context, logger: Logger, info: Progr
     }
   };
 
-  return { onProgress, finish };
+  return { onProgress, finish, setFound };
 }

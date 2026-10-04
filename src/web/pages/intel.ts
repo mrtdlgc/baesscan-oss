@@ -1,6 +1,9 @@
+import { getChain } from "../../chains/registry";
+import type { ChainSlug } from "../../types";
 import { blockscoutPoweredLink, escapeAttr, escapeText, page } from "./shared";
 
 interface IntelHomePageOptions {
+  walletPnlChain: ChainSlug;
   walletPnlEnabled: boolean;
 }
 
@@ -62,6 +65,7 @@ const INTEL_CARDS: Array<{ href: string; label: string; kicker: string; body: st
 ];
 
 export function intelHomePage(options: IntelHomePageOptions): string {
+  const chainName = getChain(options.walletPnlChain).name;
   return page("baes intel", `
     <div class="intel-home-shell">
       <aside class="dex-sidebar" aria-label="Intel navigation">
@@ -81,6 +85,12 @@ export function intelHomePage(options: IntelHomePageOptions): string {
           <a href="/intel/wallet-pnl/status"><span class="nav-icon">S</span>Status</a>
           <a href="/"><span class="nav-icon">B</span>Buybot</a>
         </nav>
+        <div class="side-block">
+          <p>Access</p>
+          <span class="side-link">Self-hosted</span>
+          <span class="side-link">${escapeText(chainName)}</span>
+          <span class="side-link">${options.walletPnlEnabled ? "Indexer enabled" : "Indexer disabled"}</span>
+        </div>
       </aside>
 
       <div class="intel-home-main">
@@ -90,6 +100,18 @@ export function intelHomePage(options: IntelHomePageOptions): string {
           <p>Wallet PnL, token risk, and cohort tools. The self-hosted edition exposes these pages directly; enable <code>WALLET_PNL_ENABLED=true</code> to start the indexer.</p>
           ${blockscoutPoweredLink("blockscout-hero-badge is-intel")}
           <dl class="intel-gate-strip">
+            <div>
+              <dt>Access</dt>
+              <dd>Open</dd>
+            </div>
+            <div>
+              <dt>Chain</dt>
+              <dd>${escapeText(chainName)}</dd>
+            </div>
+            <div>
+              <dt>Tools</dt>
+              <dd>Wallets and tokens</dd>
+            </div>
             <div>
               <dt>Indexer</dt>
               <dd>${options.walletPnlEnabled ? "Enabled" : "Disabled"}</dd>
@@ -103,7 +125,7 @@ export function intelHomePage(options: IntelHomePageOptions): string {
       </div>
     </div>
   `, {
-    description: "Self-hosted baes intel for wallet PnL, New Tokens, risk clusters, overlap cohorts, and retained-window flow.",
+    description: `Self-hosted baes intel for wallet PnL, New Tokens, risk clusters, overlap cohorts, and retained-window flow on ${chainName}.`,
     canonicalPath: "/intel",
     imagePath: "/og/baes-intel.png"
   });
